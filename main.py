@@ -1,0 +1,2299 @@
+
+import os
+import re
+import json
+import math
+import sqlite3
+import asyncio
+import logging
+import time
+import threading
+from collections import Counter, defaultdict
+from typing import Any, Dict, List, Optional, Tuple
+
+from telegram import Update
+from telegram.error import NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DB_FILE = os.getenv("DB_FILE", "ai_state.db")
+
+THRESHOLD = int(os.getenv("THRESHOLD", "11"))
+LOW_LABEL = os.getenv("LOW_LABEL", "Xỉu")
+HIGH_LABEL = os.getenv("HIGH_LABEL", "Tài")
+
+RECENT_WINDOW = int(os.getenv("RECENT_WINDOW", "80"))
+MID_WINDOW = int(os.getenv("MID_WINDOW", "240"))
+SHORT_WINDOW = int(os.getenv("SHORT_WINDOW", "24"))
+
+MAX_INPUT_NUMS = int(os.getenv("MAX_INPUT_NUMS", "120"))
+USER_CACHE_LIMIT = int(os.getenv("USER_CACHE_LIMIT", "500"))
+MAX_DB_HISTORY = int(os.getenv("MAX_DB_HISTORY", "2500"))
+MAX_HEALTH_LOG = int(os.getenv("MAX_HEALTH_LOG", "240"))
+MAX_PATTERN_MEMORY = int(os.getenv("MAX_PATTERN_MEMORY", "1800"))
+PATTERN_DECAY = float(os.getenv("PATTERN_DECAY", "0.990"))
+ANALYSIS_DELAY_SECONDS = float(os.getenv("ANALYSIS_DELAY_SECONDS", "2.2"))
+MIN_ANALYSIS_LEN = int(os.getenv("MIN_ANALYSIS_LEN", "15"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "62"))
+
+DRIFT_MIN_SHIFT = float(os.getenv("DRIFT_MIN_SHIFT", "0.18"))
+DRIFT_STRONG_SHIFT = float(os.getenv("DRIFT_STRONG_SHIFT", "0.30"))
+WHITE_SHIFT_THRESHOLD = float(os.getenv("WHITE_SHIFT_THRESHOLD", "0.32"))
+WHITE_MIN_SCORE = float(os.getenv("WHITE_MIN_SCORE", "62"))
+
+GHOST_HARD_CLEAN = float(os.getenv("GHOST_HARD_CLEAN", "85"))
+GHOST_SOFT_CLEAN = float(os.getenv("GHOST_SOFT_CLEAN", "65"))
+GHOST_WARN = float(os.getenv("GHOST_WARN", "55"))
+MAX_DB_RETRIES = int(os.getenv("MAX_DB_RETRIES", "5"))
+DB_RETRY_BASE_DELAY = float(os.getenv("DB_RETRY_BASE_DELAY", "0.35"))
+HEALTH_WATCHDOG_SECONDS = int(os.getenv("HEALTH_WATCHDOG_SECONDS", "300"))
+
+if not TOKEN:
+    raise RuntimeError("❌ Thiếu TELEGRAM_BOT_TOKEN")
+
+DB_LOCK = asyncio.Lock()
+STATE_LOCK = asyncio.Lock()
+
+users: Dict[int, Dict[str, Any]] = {}
+analysis_tasks: Dict[int, asyncio.Task] = {}
+analysis_versions: Dict[int, int] = defaultdict(int)
+
+LAST_ACTIVITY_TS = time.time()
+LAST_ACTIVITY_LOCK = threading.Lock()
+HEARTBEAT_TIMEOUT_SECONDS = int(os.getenv("HEARTBEAT_TIMEOUT_SECONDS", "900"))
+HEARTBEAT_POLL_SECONDS = int(os.getenv("HEARTBEAT_POLL_SECONDS", "30"))
+WATCHDOG_THREAD_STARTED = False
+WATCHDOG_THREAD_LOCK = threading.Lock()
+
+
+def touch_activity() -> None:
+    global LAST_ACTIVITY_TS
+    with LAST_ACTIVITY_LOCK:
+        LAST_ACTIVITY_TS = time.time()
+
+
+def immortality_watchdog() -> None:
+    while True:
+        time.sleep(HEARTBEAT_POLL_SECONDS)
+        with LAST_ACTIVITY_LOCK:
+            idle = time.time() - LAST_ACTIVITY_TS
+        if idle > HEARTBEAT_TIMEOUT_SECONDS:
+            logger.error("No heartbeat for %.1fs; forcing restart", idle)
+            os._exit(1)
+
+
+def new_user() -> Dict[str, Any]:
+    return {
+        "values": [],
+        "labels": [],
+        "history": [],
+        "low_count": 0,
+        "high_count": 0,
+        "mode": "WARMUP",
+        "ghost_mode": False,
+        "updates": 0,
+        "cleanups": 0,
+        "last_clean_score": 0.0,
+        "health_log": [],
+        "monitor_log": [],
+        "recheck_log": [],
+        "recheck_count": 0,
+        "last_recheck_score": 0.0,
+        "stability_score": 100.0,
+        "error_count": 0,
+        "pattern_memory": defaultdict(float),
+    }
+
+
+def safe_db_call(fn, retries: int = MAX_DB_RETRIES, base_delay: float = DB_RETRY_BASE_DELAY):
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if "locked" not in msg and "busy" not in msg:
+                raise
+            last_exc = e
+            time.sleep(base_delay * (attempt + 1))
+        except sqlite3.DatabaseError as e:
+            last_exc = e
+            time.sleep(base_delay * (attempt + 1))
+    if last_exc:
+        raise last_exc
+
+
+async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Global handler caught error: %s", context.error)
+    err = context.error
+    if isinstance(err, RetryAfter):
+        await asyncio.sleep(err.retry_after + 1)
+    elif isinstance(err, (TimedOut, NetworkError, TelegramError)):
+        await asyncio.sleep(1.0)
+    try:
+        if getattr(update, "message", None):
+            await update.message.reply_text("⚠️ Có lỗi tạm thời, bot đã tự giữ an toàn và tiếp tục chạy.")
+    except Exception:
+        pass
+
+
+async def health_watchdog() -> None:
+    while True:
+        try:
+            trim_cache()
+            for d in list(users.values()):
+                try:
+                    repair_state(d)
+                    trim_state_memory(d)
+                except Exception:
+                    logger.exception("watchdog repair failed")
+            touch_activity()
+        except Exception:
+            logger.exception("health watchdog failed")
+        await asyncio.sleep(HEALTH_WATCHDOG_SECONDS)
+
+
+def db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    return conn
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return [r["name"] for r in rows]
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, col_def: str) -> None:
+    col_name = col_def.split()[0]
+    if col_name not in _table_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
+
+
+def init_db() -> None:
+    def _work():
+        with db_connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    chat_id INTEGER PRIMARY KEY,
+                    low_count INTEGER NOT NULL DEFAULT 0,
+                    high_count INTEGER NOT NULL DEFAULT 0,
+                    mode TEXT NOT NULL DEFAULT 'WARMUP',
+                    ghost_mode INTEGER NOT NULL DEFAULT 0,
+                    updates INTEGER NOT NULL DEFAULT 0,
+                    cleanups INTEGER NOT NULL DEFAULT 0,
+                    last_clean_score REAL NOT NULL DEFAULT 0.0,
+                    stability_score REAL NOT NULL DEFAULT 100.0,
+                    error_count INTEGER NOT NULL DEFAULT 0,
+                    recheck_count INTEGER NOT NULL DEFAULT 0,
+                    last_recheck_score REAL NOT NULL DEFAULT 0.0,
+                    health_log_json TEXT NOT NULL DEFAULT '[]',
+                    monitor_log_json TEXT NOT NULL DEFAULT '[]',
+                    recheck_log_json TEXT NOT NULL DEFAULT '[]'
+                );
+
+                CREATE TABLE IF NOT EXISTS history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    raw_value INTEGER NOT NULL,
+                    label TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'real',
+                    conf REAL NOT NULL DEFAULT 1.0,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_history_chat_id_id ON history(chat_id, id);
+
+                CREATE TABLE IF NOT EXISTS pattern_memory (
+                    chat_id INTEGER NOT NULL,
+                    pattern TEXT NOT NULL,
+                    weight REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY (chat_id, pattern)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pattern_chat_id ON pattern_memory(chat_id);
+                """
+            )
+            _ensure_column(conn, "users", "ghost_mode INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "users", "cleanups INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "users", "last_clean_score REAL NOT NULL DEFAULT 0.0")
+            _ensure_column(conn, "users", "stability_score REAL NOT NULL DEFAULT 100.0")
+            _ensure_column(conn, "users", "error_count INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "users", "recheck_count INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "users", "last_recheck_score REAL NOT NULL DEFAULT 0.0")
+            _ensure_column(conn, "users", "health_log_json TEXT NOT NULL DEFAULT '[]'")
+            _ensure_column(conn, "users", "monitor_log_json TEXT NOT NULL DEFAULT '[]'")
+            _ensure_column(conn, "users", "recheck_log_json TEXT NOT NULL DEFAULT '[]'")
+            conn.commit()
+
+    safe_db_call(_work)
+
+
+async def wipe_all_state() -> None:
+    async with DB_LOCK:
+        def _work():
+            with db_connect() as conn:
+                conn.execute("DELETE FROM history")
+                conn.execute("DELETE FROM pattern_memory")
+                conn.execute("DELETE FROM users")
+                conn.commit()
+
+        safe_db_call(_work)
+
+
+async def delete_chat_state(chat_id: int) -> None:
+    async with DB_LOCK:
+        def _work():
+            with db_connect() as conn:
+                conn.execute("DELETE FROM history WHERE chat_id = ?", (chat_id,))
+                conn.execute("DELETE FROM pattern_memory WHERE chat_id = ?", (chat_id,))
+                conn.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
+                conn.commit()
+
+        safe_db_call(_work)
+
+
+def _safe_tail(seq: List[Any], limit: int) -> List[Any]:
+    if limit <= 0:
+        return []
+    return list(seq[-limit:]) if len(seq) > limit else list(seq)
+
+
+def trim_cache() -> None:
+    if len(users) <= USER_CACHE_LIMIT:
+        return
+    overflow = len(users) - USER_CACHE_LIMIT
+    for chat_id in list(users.keys())[:overflow]:
+        users.pop(chat_id, None)
+
+
+def trim_state_memory(d: Dict[str, Any]) -> None:
+    d["values"] = _safe_tail(d.get("values", []), MAX_DB_HISTORY)
+    d["labels"] = _safe_tail(d.get("labels", []), MAX_DB_HISTORY)
+    d["history"] = _safe_tail(d.get("history", []), 80)
+    d["health_log"] = _safe_tail(d.get("health_log", []), MAX_HEALTH_LOG)
+    d["monitor_log"] = _safe_tail(d.get("monitor_log", []), MAX_HEALTH_LOG)
+    d["recheck_log"] = _safe_tail(d.get("recheck_log", []), MAX_HEALTH_LOG)
+
+
+def _deserialize_float_map(src: Dict[str, float]) -> defaultdict:
+    out = defaultdict(float)
+    for k, v in (src or {}).items():
+        out[k] = float(v)
+    return out
+
+
+def rebuild_counters(d: Dict[str, Any]) -> None:
+    labels = d.get("labels", [])
+    d["low_count"] = labels.count(LOW_LABEL)
+    d["high_count"] = labels.count(HIGH_LABEL)
+    d["updates"] = len(labels)
+
+
+def repair_state(d: Dict[str, Any]) -> Dict[str, Any]:
+    for k in ("values", "labels", "history", "health_log", "monitor_log", "recheck_log"):
+        if not isinstance(d.get(k), list):
+            d[k] = []
+    if not isinstance(d.get("pattern_memory"), defaultdict):
+        d["pattern_memory"] = _deserialize_float_map(dict(d.get("pattern_memory", {})))
+
+    n = min(len(d["values"]), len(d["labels"]))
+    d["values"] = d["values"][-n:] if n else []
+    d["labels"] = d["labels"][-n:] if n else []
+
+    d.setdefault("mode", "WARMUP")
+    d.setdefault("ghost_mode", False)
+    d.setdefault("cleanups", 0)
+    d.setdefault("last_clean_score", 0.0)
+    d.setdefault("stability_score", 100.0)
+    d.setdefault("error_count", 0)
+    d.setdefault("recheck_count", 0)
+    d.setdefault("last_recheck_score", 0.0)
+
+    rebuild_counters(d)
+    trim_state_memory(d)
+    return d
+
+
+async def load_user(chat_id: int) -> Dict[str, Any]:
+    if chat_id in users:
+        return repair_state(users[chat_id])
+
+    state = new_user()
+
+    def _work():
+        with db_connect() as conn:
+            row = conn.execute(
+                """
+                SELECT low_count, high_count, mode, ghost_mode, updates,
+                       cleanups, last_clean_score, stability_score, error_count,
+                       recheck_count, last_recheck_score,
+                       health_log_json, monitor_log_json, recheck_log_json
+                FROM users WHERE chat_id = ?
+                """,
+                (chat_id,),
+            ).fetchone()
+
+            hist_rows = conn.execute(
+                "SELECT raw_value, label FROM history WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+                (chat_id, MAX_DB_HISTORY),
+            ).fetchall()
+
+            pat_rows = conn.execute(
+                """
+                SELECT pattern, weight FROM pattern_memory
+                WHERE chat_id = ?
+                ORDER BY weight DESC, pattern ASC
+                LIMIT ?
+                """,
+                (chat_id, MAX_PATTERN_MEMORY),
+            ).fetchall()
+
+            return row, hist_rows, pat_rows
+
+    async with DB_LOCK:
+        row, hist_rows, pat_rows = safe_db_call(_work)
+
+    if row:
+        state["low_count"] = int(row["low_count"])
+        state["high_count"] = int(row["high_count"])
+        state["mode"] = row["mode"] or "WARMUP"
+        state["ghost_mode"] = bool(int(row["ghost_mode"] or 0))
+        state["updates"] = int(row["updates"] or 0)
+        state["cleanups"] = int(row["cleanups"] or 0)
+        state["last_clean_score"] = float(row["last_clean_score"] or 0.0)
+        state["stability_score"] = float(row["stability_score"] or 100.0)
+        state["error_count"] = int(row["error_count"] or 0)
+        state["recheck_count"] = int(row["recheck_count"] or 0)
+        state["last_recheck_score"] = float(row["last_recheck_score"] or 0.0)
+        for field in ("health_log_json", "monitor_log_json", "recheck_log_json"):
+            try:
+                state[field.replace("_json", "")] = list(json.loads(row[field] or "[]"))
+            except Exception:
+                state[field.replace("_json", "")] = []
+
+    for r in reversed(hist_rows):
+        state["values"].append(int(r["raw_value"]))
+        state["labels"].append(r["label"])
+
+    state["pattern_memory"] = _deserialize_float_map({r["pattern"]: float(r["weight"]) for r in pat_rows})
+    state["history"] = [{"value": v, "label": l, "source": "real", "conf": 1.0} for v, l in list(zip(state["values"], state["labels"]))[-80:]]
+    repair_state(state)
+    users[chat_id] = state
+    trim_cache()
+    return state
+
+
+async def save_user_meta(chat_id: int, d: Dict[str, Any]) -> None:
+    async with DB_LOCK:
+        def _work():
+            with db_connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO users (
+                        chat_id, low_count, high_count, mode, ghost_mode,
+                        updates, cleanups, last_clean_score, stability_score, error_count,
+                        recheck_count, last_recheck_score,
+                        health_log_json, monitor_log_json, recheck_log_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        low_count=excluded.low_count,
+                        high_count=excluded.high_count,
+                        mode=excluded.mode,
+                        ghost_mode=excluded.ghost_mode,
+                        updates=excluded.updates,
+                        cleanups=excluded.cleanups,
+                        last_clean_score=excluded.last_clean_score,
+                        stability_score=excluded.stability_score,
+                        error_count=excluded.error_count,
+                        recheck_count=excluded.recheck_count,
+                        last_recheck_score=excluded.last_recheck_score,
+                        health_log_json=excluded.health_log_json,
+                        monitor_log_json=excluded.monitor_log_json,
+                        recheck_log_json=excluded.recheck_log_json
+                    """,
+                    (
+                        chat_id,
+                        int(d.get("low_count", 0)),
+                        int(d.get("high_count", 0)),
+                        d.get("mode", "WARMUP"),
+                        1 if d.get("ghost_mode", False) else 0,
+                        int(d.get("updates", 0)),
+                        int(d.get("cleanups", 0)),
+                        float(d.get("last_clean_score", 0.0)),
+                        float(d.get("stability_score", 100.0)),
+                        int(d.get("error_count", 0)),
+                        int(d.get("recheck_count", 0)),
+                        float(d.get("last_recheck_score", 0.0)),
+                        json.dumps(_safe_tail(d.get("health_log", []), MAX_HEALTH_LOG), ensure_ascii=False),
+                        json.dumps(_safe_tail(d.get("monitor_log", []), MAX_HEALTH_LOG), ensure_ascii=False),
+                        json.dumps(_safe_tail(d.get("recheck_log", []), MAX_HEALTH_LOG), ensure_ascii=False),
+                    ),
+                )
+                conn.commit()
+
+        safe_db_call(_work)
+
+
+def prune_chat_rows(conn: sqlite3.Connection, chat_id: int, keep_limit: int) -> None:
+    row = conn.execute(
+        "SELECT id FROM history WHERE chat_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?",
+        (chat_id, max(0, keep_limit - 1)),
+    ).fetchone()
+    if row:
+        conn.execute("DELETE FROM history WHERE chat_id = ? AND id < ?", (chat_id, int(row["id"])))
+
+
+async def persist_snapshot(chat_id: int, d: Dict[str, Any], entries: List[Tuple[int, str, str, float]]) -> None:
+    keep_limit = max(400, MAX_DB_HISTORY // 2) if d.get("ghost_mode", False) else MAX_DB_HISTORY
+    async with DB_LOCK:
+        def _work():
+            with db_connect() as conn:
+                for raw_value, label, source, conf in entries:
+                    conn.execute(
+                        "INSERT INTO history (chat_id, raw_value, label, source, conf) VALUES (?, ?, ?, ?, ?)",
+                        (chat_id, int(raw_value), label, source, float(conf)),
+                    )
+
+                conn.execute("DELETE FROM pattern_memory WHERE chat_id = ?", (chat_id,))
+                for pattern, weight in d.get("pattern_memory", {}).items():
+                    if float(weight) >= 0.05:
+                        conn.execute(
+                            "INSERT INTO pattern_memory (chat_id, pattern, weight) VALUES (?, ?, ?)",
+                            (chat_id, pattern, float(weight)),
+                        )
+
+                conn.execute(
+                    """
+                    INSERT INTO users (
+                        chat_id, low_count, high_count, mode, ghost_mode,
+                        updates, cleanups, last_clean_score, stability_score, error_count,
+                        recheck_count, last_recheck_score,
+                        health_log_json, monitor_log_json, recheck_log_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        low_count=excluded.low_count,
+                        high_count=excluded.high_count,
+                        mode=excluded.mode,
+                        ghost_mode=excluded.ghost_mode,
+                        updates=excluded.updates,
+                        cleanups=excluded.cleanups,
+                        last_clean_score=excluded.last_clean_score,
+                        stability_score=excluded.stability_score,
+                        error_count=excluded.error_count,
+                        recheck_count=excluded.recheck_count,
+                        last_recheck_score=excluded.last_recheck_score,
+                        health_log_json=excluded.health_log_json,
+                        monitor_log_json=excluded.monitor_log_json,
+                        recheck_log_json=excluded.recheck_log_json
+                    """,
+                    (
+                        chat_id,
+                        int(d.get("low_count", 0)),
+                        int(d.get("high_count", 0)),
+                        d.get("mode", "WARMUP"),
+                        1 if d.get("ghost_mode", False) else 0,
+                        int(d.get("updates", 0)),
+                        int(d.get("cleanups", 0)),
+                        float(d.get("last_clean_score", 0.0)),
+                        float(d.get("stability_score", 100.0)),
+                        int(d.get("error_count", 0)),
+                        int(d.get("recheck_count", 0)),
+                        float(d.get("last_recheck_score", 0.0)),
+                        json.dumps(_safe_tail(d.get("health_log", []), MAX_HEALTH_LOG), ensure_ascii=False),
+                        json.dumps(_safe_tail(d.get("monitor_log", []), MAX_HEALTH_LOG), ensure_ascii=False),
+                        json.dumps(_safe_tail(d.get("recheck_log", []), MAX_HEALTH_LOG), ensure_ascii=False),
+                    ),
+                )
+                prune_chat_rows(conn, chat_id, keep_limit)
+                conn.commit()
+
+        safe_db_call(_work)
+
+
+def get_key(update: Update) -> int:
+    return update.effective_chat.id
+
+
+def map_value(n: int) -> str:
+    return HIGH_LABEL if n >= THRESHOLD else LOW_LABEL
+
+
+def parse_input(text: str) -> List[int]:
+    nums: List[int] = []
+    for x in re.findall(r"\d+", text or ""):
+        try:
+            n = int(x)
+            if n > 0:
+                nums.append(n)
+        except Exception:
+            pass
+    return nums[:MAX_INPUT_NUMS]
+
+
+def safe_div(a: float, b: float) -> float:
+    return a / b if b else 0.0
+
+
+def format_prob_inline(probs: Dict[str, float]) -> str:
+    low_p = probs.get(LOW_LABEL, 0.5) * 100
+    high_p = probs.get(HIGH_LABEL, 0.5) * 100
+    return f"{LOW_LABEL}: {low_p:.1f}% | {HIGH_LABEL}: {high_p:.1f}%"
+
+
+def format_history(labels: List[str], tail: int = 24) -> str:
+    if not labels:
+        return "(trống)"
+    view = labels[-tail:] if len(labels) > tail else labels[:]
+    return "".join("⬛" if lb == HIGH_LABEL else "⬜" if lb == LOW_LABEL else "·" for lb in view)
+
+
+def format_pattern_lines(patterns: List[Tuple[str, float]], top_n: int = 3) -> str:
+    if not patterns:
+        return "Không có"
+    items = []
+    for p, w in patterns[:top_n]:
+        short_p = p if len(p) <= 24 else p[:21] + "..."
+        items.append(f"{short_p}({w:.1f})")
+    return " | ".join(items) if items else "Không có"
+
+
+def make_bar(pct: float, width: int = 12) -> str:
+    pct = max(0.0, min(100.0, float(pct)))
+    filled = int(round((pct / 100.0) * width))
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
+def layer_ratio(labels: List[str]) -> Dict[str, float]:
+    if not labels:
+        return {LOW_LABEL: 0.5, HIGH_LABEL: 0.5}
+    c = Counter(labels)
+    total = c[LOW_LABEL] + c[HIGH_LABEL]
+    if total <= 0:
+        return {LOW_LABEL: 0.5, HIGH_LABEL: 0.5}
+    return {LOW_LABEL: c[LOW_LABEL] / total, HIGH_LABEL: c[HIGH_LABEL] / total}
+
+
+def split_layers(labels: List[str]) -> Tuple[List[str], List[str], List[str]]:
+    recent = labels[-RECENT_WINDOW:] if len(labels) > RECENT_WINDOW else labels[:]
+    mid_end = max(0, len(labels) - len(recent))
+    mid_start = max(0, mid_end - MID_WINDOW)
+    mid = labels[mid_start:mid_end]
+    old = labels[:mid_start]
+    return recent, mid, old
+
+
+def normalize_probs(scores: Dict[str, float]) -> Dict[str, float]:
+    scores = {LOW_LABEL: max(0.0, scores.get(LOW_LABEL, 0.0)), HIGH_LABEL: max(0.0, scores.get(HIGH_LABEL, 0.0))}
+    total = scores[LOW_LABEL] + scores[HIGH_LABEL]
+    if total <= 0:
+        return {LOW_LABEL: 0.5, HIGH_LABEL: 0.5}
+    return {LOW_LABEL: scores[LOW_LABEL] / total, HIGH_LABEL: scores[HIGH_LABEL] / total}
+
+
+def jensen_shannon_divergence(p: Dict[str, float], q: Dict[str, float]) -> float:
+    def kl(a: Dict[str, float], b: Dict[str, float]) -> float:
+        s = 0.0
+        for k in (LOW_LABEL, HIGH_LABEL):
+            av = max(a.get(k, 0.0), 1e-12)
+            bv = max(b.get(k, 0.0), 1e-12)
+            s += av * math.log2(av / bv)
+        return s
+
+    m = {
+        LOW_LABEL: (p.get(LOW_LABEL, 0.5) + q.get(LOW_LABEL, 0.5)) / 2.0,
+        HIGH_LABEL: (p.get(HIGH_LABEL, 0.5) + q.get(HIGH_LABEL, 0.5)) / 2.0,
+    }
+    return max(0.0, min(1.0, 0.5 * kl(p, m) + 0.5 * kl(q, m)))
+
+
+def entropy_score(labels: List[str]) -> float:
+    tail = labels[-20:]
+    if len(tail) < 8:
+        return 0.0
+    c = Counter(tail)
+    total = sum(c.values())
+    ent = 0.0
+    for v in c.values():
+        p = v / total
+        ent -= p * math.log2(p)
+    return ent / math.log2(2)
+
+
+def volatility_score(labels: List[str]) -> float:
+    tail = labels[-12:]
+    if len(tail) < 8:
+        return 0.0
+    changes = sum(1 for i in range(1, len(tail)) if tail[i] != tail[i - 1])
+    return changes / (len(tail) - 1)
+
+
+def current_streak(labels: List[str]) -> Tuple[Optional[str], int]:
+    if not labels:
+        return None, 0
+    last = labels[-1]
+    streak = 1
+    for i in range(len(labels) - 2, -1, -1):
+        if labels[i] == last:
+            streak += 1
+        else:
+            break
+    return last, streak
+
+
+def alternating_analysis(labels: List[str]) -> Tuple[bool, float]:
+    if len(labels) < 6:
+        return False, 0.0
+    tail = labels[-6:]
+    changes = sum(1 for i in range(1, len(tail)) if tail[i] != tail[i - 1])
+    ratio = changes / (len(tail) - 1)
+    return all(tail[i] != tail[i - 1] for i in range(1, len(tail))), ratio
+
+
+def long_bias(labels: List[str]) -> Tuple[str, int]:
+    if len(labels) < 20:
+        return "BALANCED", 0
+    low = labels.count(LOW_LABEL)
+    high = labels.count(HIGH_LABEL)
+    gap = abs(low - high)
+    if gap >= 20:
+        return "IMBALANCED_STRONG", 3
+    if gap >= 12:
+        return "IMBALANCED_MEDIUM", 2
+    if gap >= 8:
+        return "IMBALANCED_LIGHT", 1
+    return "BALANCED", 0
+
+
+def detect_repeat_cycle(labels: List[str]) -> Tuple[Optional[int], float]:
+    if len(labels) < 10:
+        return None, 0.0
+    h = labels[-min(5000, 360):]
+    best_cycle = None
+    best_score = 0.0
+    max_size = min(10, len(h) // 2)
+    for size in range(2, max_size + 1):
+        suffix = tuple(h[-size:])
+        occur = 0
+        next_counts = Counter()
+        for i in range(len(h) - size):
+            if tuple(h[i:i + size]) == suffix and i + size < len(h):
+                occur += 1
+                next_counts[h[i + size]] += 1
+        if occur >= 2 and next_counts:
+            _, cnt = next_counts.most_common(1)[0]
+            score = min((cnt / occur) * 100, 90.0)
+            if score > best_score:
+                best_score = score
+                best_cycle = size
+    return best_cycle, best_score
+
+
+def predict_cycle_next(labels: List[str], cycle_len: Optional[int]) -> Tuple[Optional[str], float]:
+    if not cycle_len or cycle_len < 2 or len(labels) < cycle_len + 2:
+        return None, 0.0
+    suffix = tuple(labels[-cycle_len:])
+    next_counts = Counter()
+    total_occ = 0
+    for i in range(len(labels) - cycle_len):
+        if tuple(labels[i:i + cycle_len]) == suffix and i + cycle_len < len(labels):
+            nxt = labels[i + cycle_len]
+            if nxt in (LOW_LABEL, HIGH_LABEL):
+                next_counts[nxt] += 1
+                total_occ += 1
+    if not next_counts or total_occ <= 0:
+        return None, 0.0
+    best, cnt = next_counts.most_common(1)[0]
+    return best, min((cnt / total_occ) * 100.0, 90.0)
+
+
+def summarize_patterns(d: Dict[str, Any], top_n: int = 5) -> List[Tuple[str, float]]:
+    items = list(d.get("pattern_memory", {}).items())
+    items.sort(key=lambda x: x[1], reverse=True)
+    return items[:top_n]
+
+
+def decay_pattern_memory(d: Dict[str, Any]) -> None:
+    pm = d.get("pattern_memory", {})
+    for k in list(pm.keys()):
+        pm[k] *= PATTERN_DECAY
+        if pm[k] < 0.05:
+            del pm[k]
+
+
+def update_pattern_memory_in_memory(d: Dict[str, Any]) -> None:
+    labels = d.get("labels", [])
+    if len(labels) >= 4:
+        d["pattern_memory"]["|".join(labels[-4:])] += 1.0
+    if len(labels) >= 5:
+        d["pattern_memory"]["|".join(labels[-5:])] += 0.7
+    if len(labels) >= 6:
+        d["pattern_memory"]["|".join(labels[-6:])] += 0.5
+    decay_pattern_memory(d)
+    if len(d["pattern_memory"]) > MAX_PATTERN_MEMORY:
+        items = sorted(d["pattern_memory"].items(), key=lambda x: x[1], reverse=True)
+        d["pattern_memory"].clear()
+        d["pattern_memory"].update(dict(items[:MAX_PATTERN_MEMORY]))
+
+
+def detect_ghost_pressure(labels: List[str]) -> Dict[str, Any]:
+    total = len(labels)
+    recent, mid, old = split_layers(labels)
+    if total < 12 or len(recent) < 8:
+        return {
+            "ghost_score": 0.0,
+            "white_score": 0.0,
+            "shift_score": 0.0,
+            "white_type": "CHƯA RÕ CẦU TRẮNG",
+            "white_detail": "Chưa đủ dữ liệu ngắn hạn",
+            "recent_entropy": 0.0,
+            "recent_volatility": 0.0,
+            "old_bias": 0.0,
+            "recent_bias": 0.0,
+            "recent_low_ratio": 0.5,
+            "old_low_ratio": 0.5,
+            "freshness": 0.0,
+            "mid_bias": 0.0,
+            "drift_js": 0.0,
+        }
+
+    recent_ratio = layer_ratio(recent)
+    mid_ratio = layer_ratio(mid)
+    old_ratio = layer_ratio(old)
+
+    recent_low_ratio = recent_ratio[LOW_LABEL]
+    old_low_ratio = old_ratio[LOW_LABEL]
+    recent_entropy = entropy_score(recent)
+    recent_vol = volatility_score(recent)
+    recent_bias = abs(recent_ratio[LOW_LABEL] - recent_ratio[HIGH_LABEL])
+    old_bias = abs(old_ratio[LOW_LABEL] - old_ratio[HIGH_LABEL])
+    mid_bias = abs(mid_ratio[LOW_LABEL] - mid_ratio[HIGH_LABEL]) if mid else 0.0
+    shift_score = abs(recent_low_ratio - old_low_ratio)
+    freshness = max(0.0, min(1.0, len(recent) / max(1, total)))
+    drift_js = jensen_shannon_divergence(recent_ratio, old_ratio)
+
+    ghost_score = (
+        shift_score * 40.0
+        + old_bias * 18.0
+        + drift_js * 22.0
+        + max(0.0, recent_entropy - 0.55) * 12.0
+        + recent_vol * 8.0
+    )
+    ghost_score = max(0.0, min(100.0, ghost_score))
+
+    if shift_score >= WHITE_SHIFT_THRESHOLD and old_bias >= 0.18:
+        if recent_entropy >= 0.72:
+            white_type = "CẦU TRẮNG BỊ ÁM"
+            white_detail = "Nhịp mới đang bị dữ liệu cũ kéo lệch"
+        else:
+            white_type = "CẦU CHUYỂN PHA"
+            white_detail = "Pha mới xuất hiện nhưng chưa khóa chắc"
+    elif recent_entropy >= 0.82 and recent_vol >= 0.50 and old_bias >= 0.12:
+        white_type = "CẦU TRẮNG KHÁNG ÁM"
+        white_detail = "Dữ liệu gần nhất đủ sạch để ưu tiên"
+    elif recent_entropy >= 0.72 and recent_vol >= 0.50:
+        white_type = "CẦU TRẮNG"
+        white_detail = "Tín hiệu ngắn hạn đang mở"
+    elif drift_js >= 0.22:
+        white_type = "CẦU CHUYỂN PHA"
+        white_detail = "Có dấu hiệu đổi pha nhưng chưa rõ"
+    else:
+        white_type = "CHƯA RÕ CẦU TRẮNG"
+        white_detail = "Chưa thấy tín hiệu trắng đủ mạnh"
+
+    return {
+        "ghost_score": ghost_score,
+        "white_score": ghost_score,
+        "shift_score": shift_score,
+        "white_type": white_type,
+        "white_detail": white_detail,
+        "recent_entropy": recent_entropy,
+        "recent_volatility": recent_vol,
+        "old_bias": old_bias,
+        "recent_bias": recent_bias,
+        "recent_low_ratio": recent_low_ratio,
+        "old_low_ratio": old_low_ratio,
+        "freshness": freshness,
+        "mid_bias": mid_bias,
+        "drift_js": drift_js,
+    }
+
+
+def analyze_sequence(d: Dict[str, Any]) -> Dict[str, Any]:
+    repair_state(d)
+    labels = d.get("labels", [])
+    total = len(labels)
+    low = labels.count(LOW_LABEL)
+    high = labels.count(HIGH_LABEL)
+
+    last_label, streak = current_streak(labels)
+    alt, alt_ratio = alternating_analysis(labels)
+    vol = volatility_score(labels)
+    ent = entropy_score(labels)
+    cycle_len, cycle_score = detect_repeat_cycle(labels)
+    ghost_info = detect_ghost_pressure(labels)
+
+    white_type = ghost_info["white_type"]
+    white_detail = ghost_info["white_detail"]
+    ghost_score = float(ghost_info["ghost_score"])
+    shift_score = float(ghost_info["shift_score"])
+    white_score = float(ghost_info["white_score"])
+    cau_type, cau_detail = detect_cau_structure(
+        {
+            "last_label": last_label,
+            "streak": streak,
+            "alternating": alt,
+            "alt_ratio": alt_ratio,
+            "volatility": vol,
+            "entropy": ent,
+            "cycle_score": cycle_score,
+            "cycle_len": cycle_len,
+            "shift_score": shift_score,
+            "ghost_score": ghost_score,
+            "low": low,
+            "high": high,
+            "patterns": summarize_patterns(d, top_n=5),
+        }
+    )
+    mode, note = detect_mode(
+        d,
+        {
+            "white_type": white_type,
+            "white_score": white_score,
+            "ghost_score": ghost_score,
+            "shift_score": shift_score,
+            "volatility": vol,
+            "entropy": ent,
+            "alternating": alt,
+            "alt_ratio": alt_ratio,
+            "cycle_score": cycle_score,
+            "cycle_len": cycle_len,
+            "last_label": last_label,
+            "streak": streak,
+            "low": low,
+            "high": high,
+        },
+    )
+    long_mode, long_score = long_bias(labels)
+
+    if white_type in ("CẦU TRẮNG BỊ ÁM", "CẦU TRẮNG KHÁNG ÁM", "CẦU CHUYỂN PHA") and white_score >= WHITE_MIN_SCORE:
+        cau_type = white_type
+        cau_detail = white_detail
+
+    d["mode"] = mode
+    return {
+        "mode": mode,
+        "note": note,
+        "total": total,
+        "low": low,
+        "high": high,
+        "last_label": last_label,
+        "streak": streak,
+        "alternating": alt,
+        "alt_ratio": alt_ratio,
+        "volatility": vol,
+        "entropy": ent,
+        "cycle_len": cycle_len,
+        "cycle_score": cycle_score,
+        "cycle_consistency": cycle_score,
+        "long_mode": long_mode,
+        "long_score": long_score,
+        "cau_type": cau_type,
+        "cau_detail": cau_detail,
+        "white_type": white_type,
+        "white_detail": white_detail,
+        "white_score": white_score,
+        "ghost_score": ghost_score,
+        "shift_score": shift_score,
+        "recent_entropy": ghost_info["recent_entropy"],
+        "recent_volatility": ghost_info["recent_volatility"],
+        "old_bias": ghost_info["old_bias"],
+        "recent_bias": ghost_info["recent_bias"],
+        "recent_low_ratio": ghost_info["recent_low_ratio"],
+        "old_low_ratio": ghost_info["old_low_ratio"],
+        "freshness": ghost_info["freshness"],
+        "mid_bias": ghost_info["mid_bias"],
+        "drift_js": ghost_info["drift_js"],
+        "patterns": summarize_patterns(d, top_n=5),
+    }
+
+
+def detect_cau_structure(report: Dict[str, Any]) -> Tuple[str, str]:
+    last_label = report.get("last_label")
+    streak = int(report.get("streak", 0))
+    alt = bool(report.get("alternating", False))
+    alt_ratio = float(report.get("alt_ratio", 0.0))
+    vol = float(report.get("volatility", 0.0))
+    ent = float(report.get("entropy", 0.0))
+    cycle_score = float(report.get("cycle_score", 0.0))
+    cycle_len = report.get("cycle_len")
+    shift_score = float(report.get("shift_score", 0.0))
+    ghost_score = float(report.get("ghost_score", 0.0))
+
+    if alt and alt_ratio >= 0.85:
+        return "CẦU XEN KẼ", "Chuỗi đổi nhịp liên tục"
+    if streak >= 5 and last_label in (LOW_LABEL, HIGH_LABEL):
+        return "CẦU BỆT", f"{last_label} x{streak}"
+    if cycle_score >= 70 and cycle_len:
+        return "CẦU LẶP", f"Chu kỳ {cycle_len}"
+    if shift_score >= WHITE_SHIFT_THRESHOLD:
+        return "CẦU CHUYỂN PHA", "Nhịp dữ liệu đang đổi"
+    if ghost_score >= GHOST_SOFT_CLEAN:
+        return "CẦU TRẮNG", "Dữ liệu gần đây đang chiếm ưu thế"
+    if vol >= 0.70:
+        return "CẦU RUNG", "Dao động mạnh"
+    if ent < 0.65:
+        return "CẦU ỔN ĐỊNH", "Biến động thấp"
+    if ent >= 0.80 and vol >= 0.55:
+        return "CẦU HỖN LOẠN", "Nhiễu tương đối cao"
+    if len(report.get("patterns", [])) > 0:
+        return "CẦU ĐUÔI MỚI", "Có mẫu lặp gần đây"
+    return "CHƯA RÕ CẦU", "Tín hiệu chưa đủ mạnh"
+
+
+def detect_mode(d: Dict[str, Any], report: Dict[str, Any]) -> Tuple[str, str]:
+    labels = d.get("labels", [])
+    if len(labels) < 10:
+        return "WARMUP", "Đang học dữ liệu"
+
+    white_type = report.get("white_type", "CHƯA RÕ CẦU TRẮNG")
+    white_score = float(report.get("white_score", 0.0))
+    ghost_score = float(report.get("ghost_score", 0.0))
+    shift_score = float(report.get("shift_score", 0.0))
+    vol = float(report.get("volatility", 0.0))
+    ent = float(report.get("entropy", 0.0))
+    alt = bool(report.get("alternating", False))
+    alt_ratio = float(report.get("alt_ratio", 0.0))
+    cycle_score = float(report.get("cycle_score", 0.0))
+    cycle_len = report.get("cycle_len")
+    last_label = report.get("last_label")
+    streak = int(report.get("streak", 0))
+    low = report.get("low", 0)
+    high = report.get("high", 0)
+    gap = abs(low - high)
+
+    if white_type in ("CẦU TRẮNG BỊ ÁM", "CẦU TRẮNG KHÁNG ÁM", "CẦU CHUYỂN PHA") and white_score >= WHITE_MIN_SCORE:
+        if white_type == "CẦU TRẮNG BỊ ÁM":
+            return "ANTI_GHOST", "Cầu mới đang bị dữ liệu cũ ám"
+        if white_type == "CẦU TRẮNG KHÁNG ÁM":
+            return "WHITE_CLEAN", "Cầu mới đã tách khỏi ám cũ"
+        return "WHITE_SHIFT", "Đang hình thành cầu mới"
+    if ghost_score >= GHOST_HARD_CLEAN:
+        return "ANTI_GHOST", "Ám lịch sử rất mạnh"
+    if ghost_score >= GHOST_SOFT_CLEAN and shift_score >= DRIFT_MIN_SHIFT:
+        return "ANTI_GHOST", "Đang có độ lệch lịch sử"
+    if alt and alt_ratio >= 1.0:
+        return "ALT", "Xen kẽ mạnh"
+    if streak >= 6:
+        return "STREAK", f"Chuỗi dài ({last_label} x{streak})"
+    if cycle_score >= 70 and cycle_len:
+        return "CYCLE", f"Vòng lặp rõ (size {cycle_len})"
+    if gap >= 20:
+        return "BIAS_STRONG", "Lệch tổng mạnh"
+    if gap >= 12:
+        return "BIAS_MEDIUM", "Lệch tổng vừa"
+    if vol >= 0.85 and ent >= 0.85:
+        return "NOISY", "Nhiễu cao"
+    if len(labels) >= 20 and abs(low - high) <= 2:
+        return "BALANCED", "Cân bằng"
+    return "NORMAL", "Ổn định"
+
+
+def weighted_label_probs(labels: List[str], window: int, decay: float) -> Dict[str, float]:
+    if not labels:
+        return {LOW_LABEL: 0.5, HIGH_LABEL: 0.5}
+    tail = labels[-window:]
+    scores = {LOW_LABEL: 0.0, HIGH_LABEL: 0.0}
+    for i, lb in enumerate(reversed(tail)):
+        w = decay ** i
+        scores[lb] += w
+    return normalize_probs(scores)
+
+
+def global_label_probs(labels: List[str]) -> Dict[str, float]:
+    return layer_ratio(labels[-MAX_DB_HISTORY:] if len(labels) > MAX_DB_HISTORY else labels)
+
+
+def markov_next_probs(labels: List[str]) -> Dict[str, float]:
+    if len(labels) < 2:
+        return {LOW_LABEL: 0.5, HIGH_LABEL: 0.5}
+    source = labels[-min(180, len(labels)):]
+    trans = {LOW_LABEL: Counter(), HIGH_LABEL: Counter()}
+    for a, b in zip(source[:-1], source[1:]):
+        trans[a][b] += 1
+    last = source[-1]
+    if not trans[last]:
+        return global_label_probs(source)
+    total = sum(trans[last].values())
+    return {LOW_LABEL: trans[last][LOW_LABEL] / total, HIGH_LABEL: trans[last][HIGH_LABEL] / total}
+
+
+def predict_from_cau_type(d: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+    labels = d.get("labels", [])
+    last_label = report.get("last_label")
+    streak = int(report.get("streak", 0))
+    cau_type = report.get("cau_type", "CHƯA RÕ CẦU")
+    white_type = report.get("white_type", "CHƯA RÕ CẦU TRẮNG")
+    cycle_len = report.get("cycle_len")
+    cycle_score = float(report.get("cycle_score", 0.0))
+    shift_score = float(report.get("shift_score", 0.0))
+    white_score = float(report.get("white_score", 0.0))
+
+    recent_labels, _, _ = split_layers(labels)
+    recent_probs = weighted_label_probs(
+        recent_labels,
+        window=max(8, min(RECENT_WINDOW, len(recent_labels))),
+        decay=0.90,
+    )
+    recent_best = max(recent_probs, key=recent_probs.get)
+    recent_gap = abs(recent_probs[LOW_LABEL] - recent_probs[HIGH_LABEL])
+
+    cycle_pred = None
+    cycle_conf = 0.0
+    if cycle_len:
+        cycle_pred, cycle_conf = predict_cycle_next(labels, cycle_len)
+
+    def opposite(lb: Optional[str]) -> Optional[str]:
+        if lb == LOW_LABEL:
+            return HIGH_LABEL
+        if lb == HIGH_LABEL:
+            return LOW_LABEL
+        return None
+
+    def pack(label: Optional[str], conf: int, note: str, source: str) -> Dict[str, Any]:
+        if label not in (LOW_LABEL, HIGH_LABEL):
+            label = recent_best if recent_best in (LOW_LABEL, HIGH_LABEL) else (last_label or LOW_LABEL)
+        return {
+            "label": label,
+            "confidence": max(0, min(100, int(conf))),
+            "note": note,
+            "source": source,
+            "cau_type": cau_type,
+            "white_type": white_type,
+        }
+
+    if cau_type == "CẦU XEN KẼ":
+        if last_label in (LOW_LABEL, HIGH_LABEL):
+            label = opposite(last_label)
+            conf = 82 if streak >= 4 else 76
+            if white_score >= 75:
+                conf += 4
+            return pack(label, conf, "Cầu xen kẽ: đảo nhịp so với ván trước.", "CẦU XEN KẼ")
+        return pack(recent_best, 58, "Chưa có ván trước rõ để đảo nhịp.", "CẦU XEN KẼ")
+
+    if cau_type == "CẦU BỆT":
+        if last_label in (LOW_LABEL, HIGH_LABEL):
+            label = last_label
+            conf = 83 if streak >= 4 else 77
+            if streak >= 6:
+                conf += 4
+            return pack(label, conf, f"Cầu bệt: ưu tiên giữ {last_label}.", "CẦU BỆT")
+        return pack(recent_best, 58, "Chưa có ván trước rõ để giữ bệt.", "CẦU BỆT")
+
+    if cau_type == "CẦU LẶP":
+        if cycle_pred in (LOW_LABEL, HIGH_LABEL):
+            conf = 80 if cycle_conf >= 70 else 72 if cycle_conf >= 55 else 66
+            return pack(cycle_pred, conf, f"Cầu lặp: theo chu kỳ {cycle_len}.", "CẦU LẶP")
+        if last_label in (LOW_LABEL, HIGH_LABEL) and streak >= 3:
+            return pack(last_label, 68, "Chưa bắt được chu kỳ rõ, tạm bám nhịp gần nhất.", "CẦU LẶP")
+        return pack(recent_best, 58, "Cầu lặp chưa đủ rõ, dùng nhịp gần nhất.", "CẦU LẶP")
+
+    if cau_type in ("CẦU CHUYỂN PHA", "CẦU ĐUÔI MỚI"):
+        if recent_best in (LOW_LABEL, HIGH_LABEL):
+            conf = 74 if recent_gap >= 0.08 else 68
+            if shift_score >= DRIFT_STRONG_SHIFT:
+                conf += 5
+            if white_type in ("CẦU TRẮNG KHÁNG ÁM", "CẦU CHUYỂN PHA"):
+                conf += 3
+            return pack(recent_best, conf, "Cầu chuyển pha: ưu tiên đuôi gần nhất.", cau_type)
+        return pack(last_label, 58, "Đang chuyển pha nhưng chưa rõ đuôi.", cau_type)
+
+    if cau_type == "CẦU TRẮNG KHÁNG ÁM":
+        return pack(
+            recent_best,
+            78 if recent_gap >= 0.06 else 70,
+            "Cầu trắng kháng ám: ưu tiên nhịp mới sạch hơn.",
+            "CẦU TRẮNG KHÁNG ÁM",
+        )
+
+    if cau_type == "CẦU TRẮNG BỊ ÁM":
+        return pack(
+            recent_best,
+            70 if recent_gap >= 0.06 else 64,
+            "Cầu trắng bị ám: vẫn đọc đuôi mới nhưng giảm tin cậy.",
+            "CẦU TRẮNG BỊ ÁM",
+        )
+
+    if cau_type == "CẦU TRẮNG":
+        return pack(
+            recent_best,
+            72 if recent_gap >= 0.06 else 66,
+            "Cầu trắng: ưu tiên tín hiệu gần nhất.",
+            "CẦU TRẮNG",
+        )
+
+    if cau_type == "CẦU RUNG":
+        if recent_gap >= 0.10:
+            return pack(recent_best, 66, "Cầu rung: dùng đuôi gần nhất vì dao động mạnh.", "CẦU RUNG")
+        if last_label in (LOW_LABEL, HIGH_LABEL):
+            return pack(opposite(last_label), 62, "Cầu rung: ưu tiên đảo nhịp ngắn hạn.", "CẦU RUNG")
+        return pack(recent_best, 56, "Cầu rung chưa đủ rõ.", "CẦU RUNG")
+
+    if cau_type == "CẦU HỖN LOẠN":
+        if recent_gap >= 0.08:
+            return pack(recent_best, 60, "Cầu hỗn loạn: chọn tín hiệu đuôi mạnh hơn.", "CẦU HỖN LOẠN")
+        if last_label in (LOW_LABEL, HIGH_LABEL):
+            return pack(last_label, 56, "Cầu hỗn loạn: bám tín hiệu vừa mới nhất.", "CẦU HỖN LOẠN")
+        return pack(recent_best, 52, "Cầu hỗn loạn quá yếu, giữ mức an toàn.", "CẦU HỖN LOẠN")
+
+    if cau_type == "CẦU ỔN ĐỊNH":
+        if last_label in (LOW_LABEL, HIGH_LABEL) and streak >= 3:
+            return pack(last_label, 75, "Cầu ổn định: bám nhịp đang chạy.", "CẦU ỔN ĐỊNH")
+        return pack(recent_best, 67, "Cầu ổn định: ưu tiên đuôi gần nhất.", "CẦU ỔN ĐỊNH")
+
+    if last_label in (LOW_LABEL, HIGH_LABEL) and recent_gap < 0.04:
+        return pack(last_label, 58, "Cầu chưa rõ: bám ván gần nhất.", "CHƯA RÕ CẦU")
+    return pack(recent_best, 60, "Cầu chưa rõ: ưu tiên đuôi gần nhất.", "CHƯA RÕ CẦU")
+
+
+def ai_new_rhythm(chat_id: int, report: Dict[str, Any], labels: List[str]) -> Dict[str, Any]:
+    recent_labels, mid_labels, old_labels = split_layers(labels)
+    recent_probs = weighted_label_probs(recent_labels, window=max(8, min(RECENT_WINDOW, len(recent_labels))), decay=0.89)
+    mid_probs = weighted_label_probs(mid_labels, window=max(8, min(MID_WINDOW, len(mid_labels))), decay=0.95)
+    markov_probs = markov_next_probs(recent_labels if recent_labels else labels)
+    global_probs = global_label_probs(labels)
+
+    last_label = report.get("last_label")
+    streak = int(report.get("streak", 0))
+    alt = bool(report.get("alternating", False))
+    alt_ratio = float(report.get("alt_ratio", 0.0))
+    vol = float(report.get("volatility", 0.0))
+    ent = float(report.get("entropy", 0.0))
+    cycle_score = float(report.get("cycle_score", 0.0))
+    cycle_len = report.get("cycle_len")
+    cycle_consistency = float(report.get("cycle_consistency", cycle_score))
+    drift_js = float(report.get("drift_js", 0.0))
+
+    recent_ratio = layer_ratio(recent_labels)
+    old_ratio = layer_ratio(old_labels) if old_labels else global_label_probs(labels)
+    shift = abs(recent_ratio[LOW_LABEL] - old_ratio[LOW_LABEL])
+
+    scores = {
+        LOW_LABEL: recent_probs[LOW_LABEL] * 0.56 + mid_probs[LOW_LABEL] * 0.14 + markov_probs[LOW_LABEL] * 0.20 + global_probs[LOW_LABEL] * 0.10,
+        HIGH_LABEL: recent_probs[HIGH_LABEL] * 0.56 + mid_probs[HIGH_LABEL] * 0.14 + markov_probs[HIGH_LABEL] * 0.20 + global_probs[HIGH_LABEL] * 0.10,
+    }
+    if streak >= 4 and last_label in (LOW_LABEL, HIGH_LABEL):
+        other = HIGH_LABEL if last_label == LOW_LABEL else LOW_LABEL
+        scores[other] += 0.10
+    if alt and alt_ratio >= 0.80 and last_label in (LOW_LABEL, HIGH_LABEL):
+        other = HIGH_LABEL if last_label == LOW_LABEL else LOW_LABEL
+        scores[other] += 0.10
+    if cycle_score >= 60 and cycle_len:
+        cycle_pred, conf = predict_cycle_next(labels, cycle_len)
+        if cycle_pred in (LOW_LABEL, HIGH_LABEL):
+            boost = 0.12 if cycle_consistency >= 60 else 0.06 if cycle_consistency >= 45 else 0.03
+            scores[cycle_pred] += (conf / 100.0) * boost
+    if vol >= 0.65:
+        scores[LOW_LABEL] += 0.02
+        scores[HIGH_LABEL] += 0.02
+    if drift_js >= 0.20:
+        scores[LOW_LABEL] += 0.01
+        scores[HIGH_LABEL] += 0.01
+
+    probs = normalize_probs(scores)
+    best = max(probs, key=probs.get)
+    delta = abs(probs[LOW_LABEL] - probs[HIGH_LABEL])
+    confidence = int(max(0, min(100, 42 + delta * 42 + (8 if len(labels) >= 30 else 4 if len(labels) >= 15 else 0) + (4 if shift >= DRIFT_MIN_SHIFT else 0) + (3 if ent >= 0.70 else 0))))
+
+    return {"engine": "NEW_RHYTHM", "status": "NHỊP MỚI", "best_label": best, "confidence": confidence, "probs": probs, "shift": shift, "note": "Ưu tiên dữ liệu gần nhất và chu kỳ ngắn"}
+
+
+def anti_ghost_weights(report: Dict[str, Any], labels: List[str]) -> Tuple[float, float, float, float]:
+    ghost_score = float(report.get("ghost_score", 0.0))
+    shift_score = float(report.get("shift_score", 0.0))
+    recent_entropy = float(report.get("recent_entropy", 0.0))
+    recent_volatility = float(report.get("recent_volatility", 0.0))
+    white_type = report.get("white_type", "CHƯA RÕ CẦU TRẮNG")
+
+    rec_w, mid_w, old_w, markov_w = 0.64, 0.20, 0.04, 0.12
+    if white_type == "CẦU TRẮNG KHÁNG ÁM":
+        rec_w, mid_w, old_w, markov_w = 0.74, 0.16, 0.00, 0.10
+    elif white_type == "CẦU TRẮNG BỊ ÁM":
+        rec_w, mid_w, old_w, markov_w = 0.82, 0.10, 0.00, 0.08
+    elif white_type == "CẦU CHUYỂN PHA":
+        rec_w, mid_w, old_w, markov_w = 0.80, 0.12, 0.00, 0.08
+    elif white_type == "CẦU TRẮNG":
+        rec_w, mid_w, old_w, markov_w = 0.70, 0.18, 0.02, 0.10
+
+    if ghost_score >= 80 or shift_score >= DRIFT_STRONG_SHIFT:
+        rec_w += 0.12
+        mid_w += 0.02
+        old_w = 0.0
+        markov_w = max(0.05, markov_w - 0.08)
+    elif ghost_score >= 65 or shift_score >= DRIFT_MIN_SHIFT:
+        rec_w += 0.08
+        mid_w += 0.01
+        old_w = max(0.0, old_w - 0.03)
+    if recent_entropy >= 0.75 or recent_volatility >= 0.50:
+        rec_w += 0.04
+        old_w = max(0.0, old_w - 0.02)
+    if len(labels) >= MAX_DB_HISTORY * 0.8:
+        old_w *= 0.75
+
+    total_w = rec_w + mid_w + old_w + markov_w
+    return rec_w / total_w, mid_w / total_w, old_w / total_w, markov_w / total_w
+
+
+def ai_anti_ghost(chat_id: int, report: Dict[str, Any], labels: List[str]) -> Dict[str, Any]:
+    recent_labels, mid_labels, old_labels = split_layers(labels)
+    recent_probs = weighted_label_probs(recent_labels, window=max(8, min(RECENT_WINDOW, len(recent_labels))), decay=0.91)
+    mid_probs = weighted_label_probs(mid_labels, window=max(8, min(MID_WINDOW, len(mid_labels))), decay=0.96)
+    old_probs = global_label_probs(old_labels) if old_labels else global_label_probs(labels)
+    global_probs = global_label_probs(labels)
+    markov_probs = markov_next_probs(labels)
+
+    rec_w, mid_w, old_w, markov_w = anti_ghost_weights(report, labels)
+    scores = {
+        LOW_LABEL: recent_probs[LOW_LABEL] * rec_w + mid_probs[LOW_LABEL] * mid_w + old_probs[LOW_LABEL] * old_w + markov_probs[LOW_LABEL] * markov_w + global_probs[LOW_LABEL] * 0.02,
+        HIGH_LABEL: recent_probs[HIGH_LABEL] * rec_w + mid_probs[HIGH_LABEL] * mid_w + old_probs[HIGH_LABEL] * old_w + markov_probs[HIGH_LABEL] * markov_w + global_probs[HIGH_LABEL] * 0.02,
+    }
+
+    cau_type = report.get("cau_type", "CHƯA RÕ CẦU")
+    last_label = report.get("last_label")
+    streak = int(report.get("streak", 0))
+    alt = bool(report.get("alternating", False))
+    alt_ratio = float(report.get("alt_ratio", 0.0))
+    vol = float(report.get("volatility", 0.0))
+    ent = float(report.get("entropy", 0.0))
+    cycle_score = float(report.get("cycle_score", 0.0))
+    cycle_len = report.get("cycle_len")
+    cycle_pred, cycle_pred_conf = predict_cycle_next(labels, cycle_len if cycle_score >= 70 else None)
+
+    if cau_type == "CẦU XEN KẼ" and last_label in (LOW_LABEL, HIGH_LABEL):
+        other = HIGH_LABEL if last_label == LOW_LABEL else LOW_LABEL
+        scores[other] *= 1.26
+        scores[other] += 0.16
+    elif cau_type == "CẦU BỆT" and last_label in (LOW_LABEL, HIGH_LABEL):
+        other = HIGH_LABEL if last_label == LOW_LABEL else LOW_LABEL
+        scores[other] *= 1.28
+        scores[other] += 0.18
+    elif cau_type == "CẦU LẶP" and cycle_pred in (LOW_LABEL, HIGH_LABEL):
+        scores[cycle_pred] *= 1.32
+        scores[cycle_pred] += (cycle_pred_conf / 100.0) * 0.14
+    elif cau_type == "CẦU RUNG":
+        scores[LOW_LABEL] = scores[LOW_LABEL] * 0.98 + 0.01
+        scores[HIGH_LABEL] = scores[HIGH_LABEL] * 0.98 + 0.01
+    elif cau_type == "CẦU ỔN ĐỊNH":
+        scores[LOW_LABEL] *= 1.02
+        scores[HIGH_LABEL] *= 1.02
+
+    if streak >= 5 and last_label in (LOW_LABEL, HIGH_LABEL):
+        other = HIGH_LABEL if last_label == LOW_LABEL else LOW_LABEL
+        scores[other] *= 1.08
+    if alt and alt_ratio >= 0.90 and last_label in (LOW_LABEL, HIGH_LABEL):
+        other = HIGH_LABEL if last_label == LOW_LABEL else LOW_LABEL
+        scores[other] *= 1.04
+    if report.get("mode") == "NOISY" or (vol >= 0.85 and ent >= 0.85):
+        scores[LOW_LABEL] = scores[LOW_LABEL] * 0.56 + 0.22
+        scores[HIGH_LABEL] = scores[HIGH_LABEL] * 0.56 + 0.22
+    if report.get("white_type") == "CẦU TRẮNG BỊ ÁM":
+        scores[LOW_LABEL] = scores[LOW_LABEL] * 0.96 + 0.02
+        scores[HIGH_LABEL] = scores[HIGH_LABEL] * 0.96 + 0.02
+
+    probs = normalize_probs(scores)
+    best_label = max(probs, key=probs.get)
+    delta = abs(probs[LOW_LABEL] - probs[HIGH_LABEL])
+
+    quality = 0
+    total = int(report.get("total", 0))
+    if total >= 30:
+        quality += 8
+    elif total >= 15:
+        quality += 4
+
+    mode = report.get("mode", "NORMAL")
+    if mode in ("STREAK", "CYCLE"):
+        quality += 7
+    elif mode in ("BALANCED", "NORMAL"):
+        quality += 2
+    elif mode == "NOISY":
+        quality -= 10
+
+    white_type = report.get("white_type", "CHƯA RÕ CẦU TRẮNG")
+    white_score = float(report.get("white_score", 0.0))
+    ghost_score = float(report.get("ghost_score", 0.0))
+    shift_score = float(report.get("shift_score", 0.0))
+    if white_type in ("CẦU TRẮNG KHÁNG ÁM", "CẦU TRẮNG BỊ ÁM", "CẦU CHUYỂN PHA"):
+        quality += 5
+        if white_score >= 75:
+            quality += 2
+    if ghost_score >= 80:
+        quality += 5
+    elif ghost_score >= 65:
+        quality += 3
+    elif shift_score >= DRIFT_MIN_SHIFT:
+        quality += 2
+
+    confidence = int(max(0, min(100, 48 + delta * 45 + quality)))
+    if total < MIN_ANALYSIS_LEN:
+        return {"engine": "ANTI_GHOST", "status": "WARMUP", "confidence": 0, "message": "Chưa đủ dữ liệu.", "best_label": None, "other_label": None, "probs": {LOW_LABEL: 0.5, HIGH_LABEL: 0.5}, "cycle_pred": cycle_pred, "cycle_pred_conf": cycle_pred_conf}
+    if confidence < MIN_CONFIDENCE:
+        return {"engine": "ANTI_GHOST", "status": "UNCERTAIN", "confidence": confidence, "message": "Tín hiệu còn yếu.", "best_label": best_label, "other_label": HIGH_LABEL if best_label == LOW_LABEL else LOW_LABEL, "probs": probs, "cycle_pred": cycle_pred, "cycle_pred_conf": cycle_pred_conf}
+
+    status = "TRENDING" if delta >= 0.08 else "BALANCED"
+    message = "Hai phía khá cân bằng." if status == "BALANCED" else f"Xu hướng nghiêng về {best_label}."
+    if white_type == "CẦU TRẮNG KHÁNG ÁM":
+        status = "WHITE_CLEAN"
+        message = "Cầu trắng sạch, ưu tiên tín hiệu gần nhất."
+    elif white_type == "CẦU TRẮNG BỊ ÁM":
+        status = "WHITE_GHOST"
+        message = "Cầu mới có dấu hiệu bị dữ liệu cũ ám."
+    elif white_type == "CẦU CHUYỂN PHA":
+        status = "WHITE_SHIFT"
+        message = "Đang chuyển pha, chỉ đọc đuôi gần nhất."
+    if streak >= 6:
+        status = "STREAK"
+        message = f"Chuỗi hiện tại rất mạnh: {last_label} x{streak}."
+    if cycle_score >= 70 and cycle_len:
+        status = "CYCLE"
+        message = f"Phát hiện vòng lặp khá rõ (size {cycle_len})."
+
+    return {"engine": "ANTI_GHOST", "status": status, "confidence": confidence, "message": message, "best_label": best_label, "other_label": HIGH_LABEL if best_label == LOW_LABEL else LOW_LABEL, "probs": probs, "cycle_pred": cycle_pred, "cycle_pred_conf": cycle_pred_conf}
+
+
+def deep_recheck_new_rhythm(d: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+    labels = d.get("labels", [])
+    total = len(labels)
+    if total < MIN_ANALYSIS_LEN:
+        return {"enabled": False, "status": "DISABLED", "confidence": 0, "note": "Chưa đủ dữ liệu để recheck", "ghost_hit": False, "drift": 0.0, "micro_drift": 0.0, "recent_score": 0.0, "old_score": 0.0}
+
+    recent, mid, old = split_layers(labels)
+    recent = recent[-max(SHORT_WINDOW, 10):] if recent else []
+    micro = labels[-max(12, SHORT_WINDOW // 2):] if len(labels) >= 12 else labels[:]
+    recent_ratio = layer_ratio(recent)
+    old_ratio = layer_ratio(old) if old else layer_ratio(labels)
+    micro_ratio = layer_ratio(micro)
+    drift = abs(recent_ratio[LOW_LABEL] - old_ratio[LOW_LABEL])
+    micro_drift = abs(micro_ratio[LOW_LABEL] - recent_ratio[LOW_LABEL])
+    recent_entropy = entropy_score(recent)
+    micro_entropy = entropy_score(micro)
+    recent_vol = volatility_score(recent)
+    micro_vol = volatility_score(micro)
+
+    ghost_hit = False
+    status = "RECHECK_CLEAN"
+    note = "Nhịp mới đã tách khỏi dữ liệu cũ"
+    if drift >= 0.22 and micro_drift >= 0.10 and (recent_entropy >= 0.65 or micro_entropy >= 0.65) and (recent_vol >= 0.35 or micro_vol >= 0.35):
+        ghost_hit = True
+        status = "RECHECK_GHOST"
+        note = "Nhịp mới vẫn bị ám bởi dữ liệu cũ"
+    elif drift >= 0.16 and (recent_entropy >= 0.72 or micro_entropy >= 0.72):
+        status = "RECHECK_SHIFT"
+        note = "Đã đổi nhịp nhưng còn nhiễu"
+    elif drift >= 0.12:
+        status = "RECHECK_WATCH"
+        note = "Có đổi nhịp nhẹ, cần theo dõi thêm"
+
+    confidence = int(max(0, min(100, 40 + drift * 55 + micro_drift * 25 + max(recent_entropy, micro_entropy) * 12 + max(recent_vol, micro_vol) * 8)))
+    d["recheck_count"] = int(d.get("recheck_count", 0)) + 1
+    d["last_recheck_score"] = round(drift * 100.0, 2)
+    d["recheck_log"].append(status)
+    d["recheck_log"] = _safe_tail(d["recheck_log"], 50)
+    if ghost_hit:
+        d["ghost_mode"] = True
+        d["monitor_log"].append("recheck_ghost")
+    elif status == "RECHECK_SHIFT":
+        d["monitor_log"].append("recheck_shift")
+    elif status == "RECHECK_WATCH":
+        d["monitor_log"].append("recheck_watch")
+    else:
+        d["monitor_log"].append("recheck_clean")
+    return {"enabled": True, "status": status, "confidence": confidence, "note": note, "ghost_hit": ghost_hit, "drift": drift, "micro_drift": micro_drift, "recent_score": recent_entropy, "old_score": entropy_score(old) if old else 0.0}
+
+
+def timing_controller_ai(
+    d: Dict[str, Any],
+    report: Dict[str, Any],
+    rhythm_ai: Dict[str, Any],
+    ghost_ai: Dict[str, Any],
+    recheck: Dict[str, Any],
+    monitor: Dict[str, Any],
+) -> Dict[str, Any]:
+    labels = d.get("labels", [])
+    total = len(labels)
+    recent = labels[-RECENT_WINDOW:] if total > RECENT_WINDOW else labels[:]
+    mid = labels[max(0, total - RECENT_WINDOW - MID_WINDOW): max(0, total - RECENT_WINDOW)] if total > RECENT_WINDOW else []
+    old = labels[:-RECENT_WINDOW] if total > RECENT_WINDOW else []
+
+    r_probs = normalize_probs(dict(rhythm_ai.get("probs", {LOW_LABEL: 0.5, HIGH_LABEL: 0.5})))
+    g_probs = normalize_probs(dict(ghost_ai.get("probs", {LOW_LABEL: 0.5, HIGH_LABEL: 0.5})))
+
+    r_best = rhythm_ai.get("best_label")
+    g_best = ghost_ai.get("best_label")
+    consensus = r_best in (LOW_LABEL, HIGH_LABEL) and r_best == g_best
+
+    prob_gap = abs(r_probs[LOW_LABEL] - r_probs[HIGH_LABEL])
+    ghost_gap = abs(g_probs[LOW_LABEL] - g_probs[HIGH_LABEL])
+    recent_ratio = layer_ratio(recent)
+    old_ratio = layer_ratio(old) if old else layer_ratio(labels)
+    drift = abs(recent_ratio[LOW_LABEL] - old_ratio[LOW_LABEL])
+    mid_ratio = layer_ratio(mid) if mid else old_ratio
+    layer_gap = abs(recent_ratio[LOW_LABEL] - mid_ratio[LOW_LABEL]) if mid else drift
+
+    white_type = report.get("white_type", "CHƯA RÕ CẦU TRẮNG")
+    ghost_score = float(report.get("ghost_score", 0.0))
+    shift_score = float(report.get("shift_score", 0.0))
+    cycle_score = float(report.get("cycle_score", 0.0))
+    streak = int(report.get("streak", 0))
+    vol = float(report.get("volatility", 0.0))
+    ent = float(report.get("entropy", 0.0))
+    freshness = float(report.get("freshness", 0.0))
+
+    stability = float(monitor.get("stability", 100.0))
+    recheck_status = recheck.get("status", "DISABLED")
+    recheck_conf = int(recheck.get("confidence", 0))
+    mode = report.get("mode", "NORMAL")
+
+    early = 0.0
+    late = 0.0
+
+    if total < MIN_ANALYSIS_LEN + 8:
+        early += 40
+    elif total < 28:
+        early += 18
+    else:
+        late += 8
+
+    if stability < 50:
+        early += 18
+    elif stability >= 78:
+        late += 10
+
+    if recheck_status == "RECHECK_GHOST":
+        early += 22
+    elif recheck_status == "RECHECK_SHIFT":
+        early += 12
+    elif recheck_status == "RECHECK_WATCH":
+        early += 6
+    elif recheck_status == "RECHECK_CLEAN":
+        late += 10
+
+    if white_type in ("CẦU TRẮNG KHÁNG ÁM", "CẦU TRẮNG BỊ ÁM", "CẦU CHUYỂN PHA"):
+        late += 12
+    else:
+        early += 5
+
+    if ghost_score >= 70:
+        early += 12
+    elif ghost_score >= 50:
+        early += 7
+
+    if shift_score >= DRIFT_STRONG_SHIFT:
+        early += 10
+        late += 5
+    elif shift_score >= DRIFT_MIN_SHIFT:
+        late += 6
+
+    if streak >= 6:
+        late += 16
+    elif streak >= 4:
+        late += 10
+    elif streak >= 3:
+        late += 6
+
+    if cycle_score >= 75:
+        late += 16
+    elif cycle_score >= 60:
+        late += 10
+    elif cycle_score >= 45:
+        late += 5
+
+    if prob_gap < 0.04:
+        early += 14
+    elif prob_gap > 0.14:
+        late += 10
+
+    if ghost_gap < 0.05:
+        early += 6
+
+    if consensus:
+        late += 12
+    elif r_best in (LOW_LABEL, HIGH_LABEL) and g_best in (LOW_LABEL, HIGH_LABEL):
+        early += 3
+
+    if vol >= 0.78:
+        early += 10
+    elif vol <= 0.30:
+        late += 5
+
+    if ent >= 0.78:
+        early += 6
+    elif ent <= 0.52:
+        late += 5
+
+    if freshness >= 0.65:
+        late += 8
+    elif freshness <= 0.35:
+        early += 3
+
+    if mode == "NOISY":
+        early += 10
+    elif mode in ("BALANCED", "NORMAL"):
+        late += 2
+
+    if recheck_conf >= 75 and recheck_status == "RECHECK_CLEAN":
+        late += 6
+
+    if drift >= 0.18:
+        late += 4
+    if layer_gap >= 0.16:
+        early += 3
+
+    state = "ON_TIME"
+    if early - late >= 12 and (total < 35 or recheck_status in ("RECHECK_GHOST", "RECHECK_SHIFT") or stability < 65):
+        state = "EARLY"
+    elif late - early >= 12 and (total >= 18 or consensus or cycle_score >= 60 or streak >= 4):
+        state = "LATE"
+
+    timing_confidence = int(max(0, min(100, 44 + abs(early - late) * 1.25 + (8 if consensus else 0) + (4 if total >= 30 else 0) - (5 if state == "EARLY" else 0))))
+    if state == "EARLY":
+        timing_confidence = min(timing_confidence, 72)
+    elif state == "LATE":
+        timing_confidence = min(100, timing_confidence + 3)
+
+    timing_bias = {"EARLY": 0.43, "ON_TIME": 0.50, "LATE": 0.61}[state]
+    note_map = {
+        "EARLY": "Tín hiệu còn non, đợi thêm để tránh chốt sớm.",
+        "ON_TIME": "Thời điểm khóa đang cân bằng.",
+        "LATE": "Tín hiệu đã đủ chín, nên khóa sớm hơn để tránh chốt trễ.",
+    }
+    return {
+        "engine": "TIMING_CONTROLLER",
+        "state": state,
+        "confidence": timing_confidence,
+        "timing_bias": timing_bias,
+        "early_score": round(early, 2),
+        "late_score": round(late, 2),
+        "consensus": bool(consensus),
+        "drift": round(drift, 3),
+        "layer_gap": round(layer_gap, 3),
+        "note": note_map[state],
+    }
+
+
+def final_decision(
+    report: Dict[str, Any],
+    rhythm_ai: Dict[str, Any],
+    ghost_ai: Dict[str, Any],
+    recheck: Dict[str, Any],
+    monitor: Dict[str, Any],
+    timing: Dict[str, Any],
+    d: Dict[str, Any],
+) -> Dict[str, Any]:
+    anchor = predict_from_cau_type(d, report)
+    best_label = anchor["label"]
+    other_label = HIGH_LABEL if best_label == LOW_LABEL else LOW_LABEL
+
+    recheck_status = recheck.get("status", "DISABLED")
+    recheck_conf = int(recheck.get("confidence", 0))
+    ghost_hit = bool(recheck.get("ghost_hit", False))
+    timing_state = timing.get("state", "ON_TIME")
+    timing_conf = int(timing.get("confidence", 0))
+    timing_note = timing.get("note", "")
+
+    ghost_score = float(report.get("ghost_score", 0.0))
+    shift_score = float(report.get("shift_score", 0.0))
+    freshness = float(report.get("freshness", 0.0))
+    mode = report.get("mode", "NORMAL")
+    stability = float(monitor.get("stability", 100.0))
+    cycle_score = float(report.get("cycle_score", 0.0))
+    cycle_len = report.get("cycle_len")
+    cycle_consistency = float(report.get("cycle_consistency", cycle_score))
+
+    r_conf = int(rhythm_ai.get("confidence", 0))
+    g_conf = int(ghost_ai.get("confidence", 0))
+    r_best = rhythm_ai.get("best_label")
+    g_best = ghost_ai.get("best_label")
+    ai_agree = r_best in (LOW_LABEL, HIGH_LABEL) and r_best == g_best and r_best == best_label
+
+    confidence = int(anchor["confidence"])
+
+    if timing_state == "EARLY":
+        confidence -= 6
+    elif timing_state == "LATE":
+        confidence += 4
+
+    if recheck_status == "RECHECK_GHOST":
+        confidence -= 8
+    elif recheck_status == "RECHECK_SHIFT":
+        confidence += 4
+    elif recheck_status == "RECHECK_CLEAN":
+        confidence += 3
+
+    if ghost_hit:
+        confidence -= 6
+
+    if stability < 45:
+        confidence -= 8
+    elif stability >= 75:
+        confidence += 4
+
+    if freshness >= 0.70:
+        confidence += 3
+
+    if mode == "NOISY":
+        confidence -= 6
+    elif mode in ("WHITE_CLEAN", "WHITE_SHIFT", "ANTI_GHOST"):
+        confidence += 2
+
+    if ai_agree:
+        confidence += 6
+    elif r_best in (LOW_LABEL, HIGH_LABEL) and g_best in (LOW_LABEL, HIGH_LABEL) and r_best == g_best != best_label:
+        confidence -= 4
+
+    if r_conf >= 70 and g_conf >= 70 and ai_agree:
+        confidence += 3
+
+    if cycle_score >= 70 and cycle_len and cycle_consistency < 60:
+        confidence -= 4
+
+    confidence = max(0, min(100, confidence))
+
+    if confidence < MIN_CONFIDENCE:
+        status = "UNCERTAIN"
+        message = f"Tín hiệu cầu chưa đủ chắc, nhưng vẫn ưu tiên loại cầu: {anchor['cau_type']}."
+    else:
+        status = "FINAL_LOCK"
+        message = anchor["note"]
+
+    return {
+        "final_label": best_label,
+        "other_label": other_label,
+        "confidence": confidence,
+        "final_probs": {
+            LOW_LABEL: 1.0 if best_label == LOW_LABEL else 0.0,
+            HIGH_LABEL: 1.0 if best_label == HIGH_LABEL else 0.0,
+        },
+        "recheck_status": recheck_status,
+        "recheck_confidence": recheck_conf,
+        "timing_state": timing_state,
+        "timing_confidence": timing_conf,
+        "timing_note": timing_note,
+        "source": anchor["source"],
+        "decision_status": status,
+        "decision_note": message,
+        "cau_type": anchor["cau_type"],
+        "white_type": anchor["white_type"],
+    }
+
+
+def build_stat_chart(labels: List[str]) -> str:
+    total = len(labels)
+    if total <= 0:
+        return (
+            "║ 📈 BIỂU ĐỒ THỐNG KÊ\n"
+            f"║ {LOW_LABEL:<5}: {'░'*12} 0.0%\n"
+            f"║ {HIGH_LABEL:<5}: {'░'*12} 0.0%"
+        )
+
+    recent = labels[-RECENT_WINDOW:] if len(labels) > RECENT_WINDOW else labels[:]
+    mid_end = max(0, len(labels) - len(recent))
+    mid_start = max(0, mid_end - MID_WINDOW)
+    mid = labels[mid_start:mid_end]
+    old = labels[:mid_start]
+
+    segs = [("GẦN", recent), ("GIỮA", mid), ("XA", old)]
+
+    lines = ["║ 📈 BIỂU ĐỒ THỐNG KÊ"]
+    for name, seg in segs:
+        ratio = layer_ratio(seg)
+        low_pct = ratio.get(LOW_LABEL, 0.5) * 100.0
+        high_pct = ratio.get(HIGH_LABEL, 0.5) * 100.0
+        spread = abs(low_pct - high_pct)
+        winner = LOW_LABEL if low_pct >= high_pct else HIGH_LABEL
+        lines.append(
+            f"║ {name:<4} {LOW_LABEL[:1]} {make_bar(low_pct):<12} {low_pct:5.1f}% | {HIGH_LABEL[:1]} {make_bar(high_pct):<12} {high_pct:5.1f}% | Lệch {spread:4.1f}% | {winner}"
+        )
+
+    overall = layer_ratio(labels)
+    overall_low = overall.get(LOW_LABEL, 0.5) * 100.0
+    overall_high = overall.get(HIGH_LABEL, 0.5) * 100.0
+    lines.append(
+        f"║ TỔNG {LOW_LABEL[:1]} {make_bar(overall_low):<12} {overall_low:5.1f}% | {HIGH_LABEL[:1]} {make_bar(overall_high):<12} {overall_high:5.1f}%"
+    )
+    return "\n".join(lines)
+
+
+def build_stats_message(report: Dict[str, Any], d: Dict[str, Any]) -> str:
+    patterns = format_pattern_lines(report.get("patterns", []))
+    hist = format_history(d.get("labels", []))
+    low_p = safe_div(report["low"] * 100.0, report["total"]) if report["total"] else 0.0
+    high_p = safe_div(report["high"] * 100.0, report["total"]) if report["total"] else 0.0
+    labels = d.get("labels", [])
+    rec = layer_ratio(labels[-RECENT_WINDOW:])
+    mid = layer_ratio(labels[max(0, len(labels) - RECENT_WINDOW - MID_WINDOW): max(0, len(labels) - RECENT_WINDOW)]) if len(labels) > RECENT_WINDOW else {LOW_LABEL: 0.5, HIGH_LABEL: 0.5}
+    old = layer_ratio(labels[:-RECENT_WINDOW] if len(labels) > RECENT_WINDOW else [])
+    chart = build_stat_chart(labels)
+    return (
+        "╔════════════════════════════╗\n"
+        "║      ✅ BẢNG THỐNG KÊ      ║\n"
+        "╠════════════════════════════╣\n"
+        f"║ {LOW_LABEL}: {report['low']} ({low_p:.1f}%)\n"
+        f"║ {HIGH_LABEL}: {report['high']} ({high_p:.1f}%)\n"
+        f"║ Tổng: {report['total']} | Mode: {report['mode']}\n"
+        f"║ Ghost: {'ON' if d.get('ghost_mode') else 'OFF'} | Cleanups: {d.get('cleanups', 0)}\n"
+        f"║ Stable: {d.get('stability_score', 100.0):.1f} | Errors: {d.get('error_count', 0)}\n"
+        f"║ Recheck: {d.get('recheck_count', 0)} | Last: {d.get('last_recheck_score', 0.0):.1f}\n"
+        "╠════════════════════════════╣\n"
+        f"║ Cầu chính: {report.get('cau_type', '-')}\n"
+        f"║ Chi tiết  : {report.get('cau_detail', '-')}\n"
+        f"║ Cầu trắng : {report.get('white_type', '-')} | {report.get('white_score', 0):.0f}\n"
+        f"║ Ghost     : {report.get('ghost_score', 0.0):.0f} | Drift {report.get('drift_js', 0.0):.2f}\n"
+        f"║ Ám cũ     : {report.get('shift_score', 0.0):.2f}\n"
+        f"║ Fresh     : {report.get('freshness', 0.0):.2f}\n"
+        f"║ Recent    : {rec.get(LOW_LABEL, 0.5)*100:.1f}% / {rec.get(HIGH_LABEL, 0.5)*100:.1f}%\n"
+        f"║ Mid       : {mid.get(LOW_LABEL, 0.5)*100:.1f}% / {mid.get(HIGH_LABEL, 0.5)*100:.1f}%\n"
+        f"║ Old       : {old.get(LOW_LABEL, 0.5)*100:.1f}% / {old.get(HIGH_LABEL, 0.5)*100:.1f}%\n"
+        f"║ Xen kẽ    : {'Có' if report['alternating'] else 'Không'} | {report['alt_ratio']:.2f}\n"
+        f"║ Bệt       : {report['last_label'] if report['last_label'] else '—'} x{report['streak']}\n"
+        f"║ Lặp       : {report['cycle_len'] if report['cycle_len'] else '—'} | {report['cycle_score']:.0f}\n"
+        f"║ Rung      : {report['volatility']:.2f}\n"
+        f"║ Ổn định   : {report['entropy']:.2f}\n"
+        f"║ Long      : {report.get('long_mode', '-')}\n"
+        f"║ Pattern   : {patterns}\n"
+        f"║ Lịch sử   : {hist}\n"
+        f"║\n{chart}\n"
+        "╚════════════════════════════╝"
+    )
+
+
+def build_loading_message(
+    report: Dict[str, Any],
+    rhythm_ai: Dict[str, Any],
+    ghost_ai: Dict[str, Any],
+    monitor: Dict[str, Any],
+    recheck: Dict[str, Any],
+    timing: Dict[str, Any],
+) -> str:
+    return (
+        "╔════════════════════════════╗\n"
+        "║      ⏳ ĐANG PHÂN TÍCH      ║\n"
+        "╠════════════════════════════╣\n"
+        f"║ Cầu: {report.get('cau_type', '-')}\n"
+        f"║ Trắng: {report.get('white_type', '-')}\n"
+        f"║ Trạng thái: {report.get('mode', '-')}\n"
+        f"║ RECHECK: {recheck.get('status', '-') } | {recheck.get('confidence', 0)}%\n"
+        f"║ AI mới: {rhythm_ai.get('status', rhythm_ai.get('engine', '-'))} | {rhythm_ai.get('confidence', 0)}%\n"
+        f"║ AI ám : {ghost_ai.get('status', ghost_ai.get('engine', '-'))} | {ghost_ai.get('confidence', 0)}%\n"
+        f"║ TIMING: {timing.get('state', '-') } | {timing.get('confidence', 0)}%\n"
+        f"║ Giám sát: {monitor.get('severity', '-')} | {monitor.get('stability', 0):.1f}\n"
+        f"║ Note: {timing.get('note', '-')}\n"
+        "║ Hệ thống đang khóa tín hiệu cũ và kiểm tra nhịp mới...\n"
+        "╚════════════════════════════╝"
+    )
+
+
+def build_analysis_message(
+    report: Dict[str, Any],
+    rhythm_ai: Dict[str, Any],
+    ghost_ai: Dict[str, Any],
+    meta: Dict[str, Any],
+    monitor: Dict[str, Any],
+    recheck: Dict[str, Any],
+    timing: Dict[str, Any],
+) -> str:
+    return (
+        "╔════════════════════════════╗\n"
+        "║       🔍 PHÂN TÍCH         ║\n"
+        "╠════════════════════════════╣\n"
+        f"║ Dựa trên: {report.get('cau_type', '-')}\n"
+        f"║ {report.get('cau_detail', '-')}\n"
+        f"║ Trắng   : {report.get('white_type', '-')} | {report.get('white_score', 0):.0f}\n"
+        f"║ Ghost   : {report.get('ghost_score', 0.0):.0f}\n"
+        f"║ Drift   : {report.get('drift_js', 0.0):.2f}\n"
+        f"║ RECHECK : {recheck.get('status', '-') } | {recheck.get('confidence', 0)}%\n"
+        f"║ RE-DRFT : {recheck.get('drift', 0.0):.2f}\n"
+        f"║ TIMING  : {timing.get('state', '-') } | {timing.get('confidence', 0)}%\n"
+        f"║ T-Note  : {timing.get('note', '-')}\n"
+        f"║ AI mới  : {rhythm_ai.get('status', '-') } | {rhythm_ai.get('confidence', 0)}%\n"
+        f"║ PX mới  : {format_prob_inline(rhythm_ai.get('probs', {LOW_LABEL: 0.5, HIGH_LABEL: 0.5}))}\n"
+        f"║ AI ám   : {ghost_ai.get('status', '-') } | {ghost_ai.get('confidence', 0)}%\n"
+        f"║ PX ám   : {format_prob_inline(ghost_ai.get('probs', {LOW_LABEL: 0.5, HIGH_LABEL: 0.5}))}\n"
+        f"║ Giám sát: {monitor.get('severity', '-') } | {monitor.get('stability', 0):.1f}\n"
+        f"║ Chốt    : {meta.get('final_label', '-')} | {meta.get('confidence', 0)}%\n"
+        f"║ Phụ     : {meta.get('other_label', '-')}\n"
+        f"║ PX chốt : {format_prob_inline(meta.get('final_probs', {LOW_LABEL: 0.5, HIGH_LABEL: 0.5}))}\n"
+        "╚════════════════════════════╝"
+    )
+
+
+def build_final_message(meta: Dict[str, Any]) -> str:
+    return (
+        f"DỰ ĐOÁN: {meta.get('final_label', '-')}\n"
+        f"TỶ LỆ: {meta.get('confidence', 0)}%"
+    )
+
+
+def anti_ghost_cleanup(d: Dict[str, Any], report: Dict[str, Any]) -> Dict[str, Any]:
+    ghost_score = float(report.get("ghost_score", 0.0))
+    pm = d.get("pattern_memory", {})
+    result = {"cleaned": False, "level": "none", "ghost_score": ghost_score, "message": ""}
+    d["last_clean_score"] = ghost_score
+
+    if ghost_score >= GHOST_HARD_CLEAN:
+        d["ghost_mode"] = True
+        pm.clear()
+        d["cleanups"] = int(d.get("cleanups", 0)) + 1
+        d["health_log"].append(0)
+        d["monitor_log"].append("hard_clean")
+        d["labels"] = _safe_tail(d["labels"], max(180, RECENT_WINDOW * 2))
+        d["values"] = _safe_tail(d["values"], max(180, RECENT_WINDOW * 2))
+        d["history"] = _safe_tail(d["history"], 80)
+        rebuild_counters(d)
+        result.update({"cleaned": True, "level": "hard", "message": f"🧹 Tự động dọn ám cũ mức {ghost_score:.0f}%. Hệ thống đã ưu tiên nhịp mới và xóa mẫu cũ."})
+        return result
+
+    if ghost_score >= GHOST_SOFT_CLEAN:
+        d["ghost_mode"] = True
+        d["cleanups"] = int(d.get("cleanups", 0)) + 1
+        d["monitor_log"].append("soft_clean")
+        for k in list(pm.keys()):
+            pm[k] *= 0.35
+            if pm[k] < 0.05:
+                del pm[k]
+        result.update({"cleaned": True, "level": "soft", "message": f"🧹 Tự động giảm ảnh hưởng lịch sử cũ, mức ám {ghost_score:.0f}%. Bot đang bám nhịp mới."})
+        return result
+
+    if ghost_score >= GHOST_WARN:
+        d["ghost_mode"] = True
+        d["monitor_log"].append("warn_clean")
+        for k in list(pm.keys()):
+            pm[k] *= 0.65
+            if pm[k] < 0.05:
+                del pm[k]
+        result.update({"cleaned": True, "level": "warn", "message": f"⚠️ Bot vừa tự làm nhẹ dữ liệu cũ, mức ám {ghost_score:.0f}%. Đang chuyển sang ưu tiên tín hiệu gần nhất."})
+        return result
+
+    d["ghost_mode"] = False
+    d["monitor_log"].append("stable")
+    return result
+
+
+def monitor_ai(chat_id: int, d: Dict[str, Any], report: Dict[str, Any], rhythm_ai: Dict[str, Any], ghost_ai: Dict[str, Any], recheck: Dict[str, Any]) -> Dict[str, Any]:
+    labels = d.get("labels", [])
+    ghost_score = float(report.get("ghost_score", 0.0))
+    shift_score = float(report.get("shift_score", 0.0))
+    freshness = float(report.get("freshness", 0.0))
+    mode = report.get("mode", "NORMAL")
+    white_type = report.get("white_type", "CHƯA RÕ CẦU TRẮNG")
+    recent_entropy = float(report.get("recent_entropy", 0.0))
+    recent_vol = float(report.get("recent_volatility", 0.0))
+    drift_js = float(report.get("drift_js", 0.0))
+    recheck_status = recheck.get("status", "DISABLED")
+    recheck_conf = int(recheck.get("confidence", 0))
+
+    stability = 100.0 - ghost_score * 0.50 - shift_score * 35.0 - drift_js * 20.0 + freshness * 10.0
+    stability += 5.0 if mode in ("NORMAL", "BALANCED", "WHITE_CLEAN") else 0.0
+    stability -= 10.0 if mode == "NOISY" else 0.0
+    if recheck_status == "RECHECK_GHOST":
+        stability -= 12.0
+    elif recheck_status == "RECHECK_SHIFT":
+        stability -= 4.0
+    elif recheck_status == "RECHECK_CLEAN":
+        stability += 4.0
+    stability = max(0.0, min(100.0, stability))
+
+    actions: List[str] = []
+    if recheck_status == "RECHECK_GHOST":
+        actions += ["nhịp mới còn bị ám cũ", "ưu tiên đuôi gần nhất"]
+    elif recheck_status == "RECHECK_SHIFT":
+        actions.append("đã đổi nhịp, còn nhiễu")
+    elif recheck_status == "RECHECK_CLEAN":
+        actions.append("nhịp mới đã sạch hơn")
+    if ghost_score >= GHOST_HARD_CLEAN:
+        actions += ["xóa mẫu cũ", "giữ đuôi mới"]
+    elif ghost_score >= GHOST_SOFT_CLEAN:
+        actions.append("giảm trọng số lịch sử")
+    elif ghost_score >= GHOST_WARN:
+        actions.append("theo dõi ám cũ")
+    if freshness >= 0.60:
+        actions.append("ưu tiên dữ liệu mới")
+    if recent_entropy >= 0.75 or recent_vol >= 0.50:
+        actions.append("đọc nhịp gần nhất")
+    if white_type in ("CẦU TRẮNG BỊ ÁM", "CẦU TRẮNG KHÁNG ÁM", "CẦU CHUYỂN PHA"):
+        actions.append("khóa theo cầu trắng")
+    if len(labels) < MIN_ANALYSIS_LEN:
+        actions.append("chưa đủ dữ liệu")
+    if not actions:
+        actions.append("ổn định")
+
+    if ghost_score >= GHOST_HARD_CLEAN:
+        d["ghost_mode"] = True
+        d["monitor_log"].append("monitor_hard_fix")
+        d["health_log"].append(0)
+        d["pattern_memory"].clear()
+        d["labels"] = _safe_tail(d["labels"], max(120, RECENT_WINDOW))
+        d["values"] = _safe_tail(d["values"], max(120, RECENT_WINDOW))
+        d["history"] = _safe_tail(d["history"], 80)
+        rebuild_counters(d)
+    elif ghost_score >= GHOST_SOFT_CLEAN:
+        d["ghost_mode"] = True
+        d["monitor_log"].append("monitor_soft_fix")
+    else:
+        d["ghost_mode"] = False
+        d["monitor_log"].append("monitor_ok")
+
+    d["stability_score"] = stability
+    d["last_clean_score"] = max(float(d.get("last_clean_score", 0.0)), ghost_score)
+    d["last_recheck_score"] = max(float(d.get("last_recheck_score", 0.0)), float(recheck.get("drift", 0.0)) * 100.0)
+
+    if int(rhythm_ai.get("confidence", 0)) < 30 and int(ghost_ai.get("confidence", 0)) < 30:
+        d["error_count"] = int(d.get("error_count", 0)) + 1
+    else:
+        d["error_count"] = max(0, int(d.get("error_count", 0)) - 1)
+
+    severity = "LOW"
+    if stability < 45:
+        severity = "HIGH"
+    elif stability < 70:
+        severity = "MEDIUM"
+
+    return {"stability": stability, "severity": severity, "actions": actions, "ghost_mode": bool(d.get("ghost_mode", False)), "error_count": int(d.get("error_count", 0)), "recheck_status": recheck_status, "recheck_confidence": recheck_conf}
+
+
+def cancel_pending_analysis(chat_id: int) -> None:
+    task = analysis_tasks.pop(chat_id, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def cancel_all_pending() -> None:
+    for chat_id in list(analysis_tasks.keys()):
+        task = analysis_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+
+
+async def delayed_analysis_job(chat_id: int, version: int, loading_msg) -> None:
+    try:
+        await asyncio.sleep(ANALYSIS_DELAY_SECONDS)
+        if analysis_versions.get(chat_id, 0) != version:
+            return
+        d = await load_user(chat_id)
+        repair_state(d)
+
+        report = analyze_sequence(d)
+        cleanup = anti_ghost_cleanup(d, report)
+        repair_state(d)
+        report = analyze_sequence(d)
+
+        recheck = deep_recheck_new_rhythm(d, report)
+        rhythm_ai = ai_new_rhythm(chat_id, report, d.get("labels", []))
+        ghost_ai = ai_anti_ghost(chat_id, report, d.get("labels", []))
+        monitor = monitor_ai(chat_id, d, report, rhythm_ai, ghost_ai, recheck)
+        timing = timing_controller_ai(d, report, rhythm_ai, ghost_ai, recheck, monitor)
+        meta = final_decision(report, rhythm_ai, ghost_ai, recheck, monitor, timing, d)
+
+        if analysis_versions.get(chat_id, 0) != version:
+            return
+        try:
+            await loading_msg.edit_text(build_analysis_message(report, rhythm_ai, ghost_ai, meta, monitor, recheck, timing))
+        except Exception:
+            try:
+                await loading_msg.reply_text(build_analysis_message(report, rhythm_ai, ghost_ai, meta, monitor, recheck, timing))
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.05)
+        try:
+            await loading_msg.reply_text(build_final_message(meta))
+        except Exception:
+            pass
+
+        await save_user_meta(chat_id, d)
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        logger.exception("delayed_analysis_job failed: %s", e)
+        try:
+            await loading_msg.reply_text("❌ Lỗi khi phân tích")
+        except Exception:
+            pass
+
+
+async def start_delayed_analysis(context: ContextTypes.DEFAULT_TYPE, chat_id: int, loading_msg) -> None:
+    analysis_versions[chat_id] += 1
+    version = analysis_versions[chat_id]
+    cancel_pending_analysis(chat_id)
+    task = context.application.create_task(delayed_analysis_job(chat_id=chat_id, version=version, loading_msg=loading_msg))
+    analysis_tasks[chat_id] = task
+
+    def _cleanup(_task: asyncio.Task) -> None:
+        if analysis_tasks.get(chat_id) is _task:
+            analysis_tasks.pop(chat_id, None)
+
+    task.add_done_callback(_cleanup)
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        chat_id = get_key(update)
+        cancel_pending_analysis(chat_id)
+        users.pop(chat_id, None)
+        await delete_chat_state(chat_id)
+        if update.message:
+            await update.message.reply_text("🔄 Đã reset chat hiện tại.")
+    except Exception as e:
+        logger.exception("reset failed: %s", e)
+        if update.message:
+            await update.message.reply_text("❌ Lỗi khi reset")
+
+
+async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        cancel_all_pending()
+        users.clear()
+        await wipe_all_state()
+        init_db()
+        if update.message:
+            await update.message.reply_text("🧼 Đã xóa sạch toàn bộ dữ liệu.")
+    except Exception as e:
+        logger.exception("factory_reset failed: %s", e)
+        if update.message:
+            await update.message.reply_text("❌ Lỗi khi factory reset")
+
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        chat_id = get_key(update)
+        d = await load_user(chat_id)
+        report = analyze_sequence(d)
+        if update.message:
+            await update.message.reply_text(build_stats_message(report, d))
+        await save_user_meta(chat_id, d)
+    except Exception as e:
+        logger.exception("stats failed: %s", e)
+        if update.message:
+            await update.message.reply_text("❌ Lỗi khi xem thống kê")
+
+
+async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.message:
+            return
+        chat_id = get_key(update)
+        d = await load_user(chat_id)
+        report = analyze_sequence(d)
+        recheck = deep_recheck_new_rhythm(d, report)
+        rhythm_ai = ai_new_rhythm(chat_id, report, d.get("labels", []))
+        ghost_ai = ai_anti_ghost(chat_id, report, d.get("labels", []))
+        monitor = monitor_ai(chat_id, d, report, rhythm_ai, ghost_ai, recheck)
+        timing = timing_controller_ai(d, report, rhythm_ai, ghost_ai, recheck, monitor)
+        await update.message.reply_text(
+            "🔧 DEBUG\n"
+            f"ghost_mode: {d.get('ghost_mode')}\n"
+            f"stability: {monitor.get('stability', 0):.1f}\n"
+            f"severity: {monitor.get('severity')}\n"
+            f"recheck: {monitor.get('recheck_status', '-')}\n"
+            f"timing: {timing.get('state', '-')}\n"
+            f"timing_conf: {timing.get('confidence', 0)}\n"
+            f"timing_note: {timing.get('note', '-')}\n"
+            f"actions: {', '.join(monitor.get('actions', []))}\n"
+            f"errors: {monitor.get('error_count', 0)}\n"
+            f"last_clean: {d.get('last_clean_score', 0.0):.1f}\n"
+            f"last_recheck: {d.get('last_recheck_score', 0.0):.1f}"
+        )
+        await save_user_meta(chat_id, d)
+    except Exception as e:
+        logger.exception("debug failed: %s", e)
+        if update.message:
+            await update.message.reply_text("❌ Lỗi khi debug")
+
+
+async def clean_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.message:
+            return
+        chat_id = get_key(update)
+        d = await load_user(chat_id)
+        report = analyze_sequence(d)
+        cleanup = anti_ghost_cleanup(d, report)
+        repair_state(d)
+        await persist_snapshot(chat_id, d, [])
+        await save_user_meta(chat_id, d)
+        if cleanup.get("cleaned"):
+            await update.message.reply_text(cleanup.get("message", "🧹 Đã dọn dữ liệu cũ."))
+        else:
+            await update.message.reply_text("✅ Hiện tại chưa cần dọn dữ liệu cũ.")
+    except Exception as e:
+        logger.exception("clean_cmd failed: %s", e)
+        if update.message:
+            await update.message.reply_text("❌ Lỗi khi dọn dữ liệu")
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.message:
+            return
+        await update.message.reply_text(
+            f"📘 TRỢ GIÚP\n"
+            f"/stats - xem bảng cầu\n"
+            f"/ai - xem phân tích + chốt\n"
+            f"/next - như /ai\n"
+            f"/debug - xem trạng thái giám sát\n"
+            f"/clean - kích hoạt dọn ám thủ công\n"
+            f"/reset - xóa dữ liệu chat hiện tại\n"
+            f"/factory_reset - xóa sạch toàn bộ bot\n\n"
+            f"Bot dùng nhiều lớp: bảng thống kê đa cửa sổ, chuỗi, xen kẽ, chu kỳ, Markov, pattern memory, RECHECK và giám sát.\n"
+            f"Khi có số mới, bot sẽ tự cập nhật thống kê và phân tích lại toàn bộ lịch sử.\n"
+            f"Quy đổi: số >= {THRESHOLD} -> {HIGH_LABEL}, số < {THRESHOLD} -> {LOW_LABEL}."
+        )
+    except Exception as e:
+        logger.exception("help failed: %s", e)
+        if update.message:
+            await update.message.reply_text("❌ Lỗi khi mở trợ giúp")
+
+
+async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.message:
+            return
+        chat_id = get_key(update)
+        d = await load_user(chat_id)
+        repair_state(d)
+        report = analyze_sequence(d)
+        cleanup = anti_ghost_cleanup(d, report)
+        repair_state(d)
+        report = analyze_sequence(d)
+
+        recheck = deep_recheck_new_rhythm(d, report)
+        rhythm_ai = ai_new_rhythm(chat_id, report, d.get("labels", []))
+        ghost_ai = ai_anti_ghost(chat_id, report, d.get("labels", []))
+        monitor = monitor_ai(chat_id, d, report, rhythm_ai, ghost_ai, recheck)
+        timing = timing_controller_ai(d, report, rhythm_ai, ghost_ai, recheck, monitor)
+        meta = final_decision(report, rhythm_ai, ghost_ai, recheck, monitor, timing, d)
+
+        await update.message.reply_text("✅ Đã cập nhật bảng thống kê. Đang phân tích lại toàn bộ lịch sử...")
+        await update.message.reply_text(build_stats_message(report, d))
+        if cleanup.get("cleaned"):
+            await update.message.reply_text(cleanup.get("message", "🧹 Bot vừa tự dọn dữ liệu cũ."))
+        loading_msg = await update.message.reply_text(build_loading_message(report, rhythm_ai, ghost_ai, monitor, recheck, timing))
+        await persist_snapshot(chat_id, d, [])
+        await save_user_meta(chat_id, d)
+        await start_delayed_analysis(context, chat_id, loading_msg)
+    except Exception as e:
+        logger.exception("ai_cmd failed: %s", e)
+        if update.message:
+            await update.message.reply_text("❌ Lỗi khi AI kết luận")
+
+
+async def next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ai_cmd(update, context)
+
+
+async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.message or not update.message.text:
+            return
+
+        chat_id = get_key(update)
+        async with STATE_LOCK:
+            d = repair_state(await load_user(chat_id))
+            nums = parse_input(update.message.text)
+            if not nums:
+                return
+
+            entries: List[Tuple[int, str, str, float]] = []
+            for n in nums:
+                label = map_value(n)
+                d["values"].append(n)
+                d["labels"].append(label)
+                d["updates"] += 1
+                d["low_count"] += 1 if label == LOW_LABEL else 0
+                d["high_count"] += 1 if label == HIGH_LABEL else 0
+                d["history"].append({"value": n, "label": label, "source": "real", "conf": 1.0})
+                d["health_log"].append(1)
+                update_pattern_memory_in_memory(d)
+                entries.append((n, label, "real", 1.0))
+
+            rebuild_counters(d)
+            trim_state_memory(d)
+
+            report_now = analyze_sequence(d)
+            cleanup = anti_ghost_cleanup(d, report_now)
+            repair_state(d)
+            report_now = analyze_sequence(d)
+
+            recheck = deep_recheck_new_rhythm(d, report_now)
+            rhythm_ai = ai_new_rhythm(chat_id, report_now, d.get("labels", []))
+            ghost_ai = ai_anti_ghost(chat_id, report_now, d.get("labels", []))
+            monitor = monitor_ai(chat_id, d, report_now, rhythm_ai, ghost_ai, recheck)
+            timing = timing_controller_ai(d, report_now, rhythm_ai, ghost_ai, recheck, monitor)
+            meta = final_decision(report_now, rhythm_ai, ghost_ai, recheck, monitor, timing, d)
+
+            await persist_snapshot(chat_id, d, entries)
+            await save_user_meta(chat_id, d)
+
+        if update.message:
+            await update.message.reply_text("✅ Đã cập nhật bảng thống kê. Bot đang phân tích lại toàn bộ lịch sử...")
+            await update.message.reply_text(build_stats_message(report_now, d))
+            if cleanup.get("cleaned"):
+                await update.message.reply_text(cleanup.get("message", "🧹 Bot vừa tự dọn dữ liệu cũ."))
+            loading_msg = await update.message.reply_text(build_loading_message(report_now, rhythm_ai, ghost_ai, monitor, recheck, timing))
+            await start_delayed_analysis(context, chat_id, loading_msg)
+    except Exception as e:
+        logger.exception("handle failed: %s", e)
+        if update.message:
+            await update.message.reply_text("❌ Lỗi khi xử lý dữ liệu")
+
+
+def main():
+    init_db()
+    global WATCHDOG_THREAD_STARTED
+    with WATCHDOG_THREAD_LOCK:
+        if not WATCHDOG_THREAD_STARTED:
+            threading.Thread(target=immortality_watchdog, daemon=True).start()
+            WATCHDOG_THREAD_STARTED = True
+
+    async def _post_init(app):
+        app.create_task(health_watchdog())
+
+    app = ApplicationBuilder().token(TOKEN).concurrent_updates(False).post_init(_post_init).build()
+    app.add_error_handler(global_error_handler)
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("ai", ai_cmd))
+    app.add_handler(CommandHandler("next", next_cmd))
+    app.add_handler(CommandHandler("debug", debug_cmd))
+    app.add_handler(CommandHandler("clean", clean_cmd))
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("factory_reset", factory_reset))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    print("🔥 SEQUENCE ANALYZER RUNNING...")
+    app.run_polling(drop_pending_updates=True)
+
+
+def run_bot_forever():
+    while True:
+        try:
+            main()
+            break
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            logger.exception("Bot crashed, restarting in 5s: %s", e)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    run_bot_forever()
