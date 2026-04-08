@@ -415,7 +415,7 @@ def detect_length_signature(segments: List[Tuple[str, int]]) -> Optional[str]:
     if len(segments) < 3:
         return None
 
-    tail = [s[1] for s in segments[-100:]]
+    tail = [s[1] for s in segments[-20:]]
 
     if len(tail) >= 4 and all(tail[i] < tail[i + 1] for i in range(len(tail) - 1)):
         return f"Cầu tăng tiến {'-'.join(map(str, tail))}"
@@ -432,7 +432,7 @@ def detect_length_signature(segments: List[Tuple[str, int]]) -> Optional[str]:
     if len(set(tail)) == 1:
         return f"Cầu nhịp đều {'-'.join(map(str, tail))}"
 
-    if len(set(tail)) >= 50:
+    if len(set(tail)) >= 6:
         return f"Cầu hỗn hợp {'-'.join(map(str, tail))}"
 
     return None
