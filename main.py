@@ -415,7 +415,7 @@ def detect_length_signature(segments: List[Tuple[str, int]]) -> Optional[str]:
     if len(segments) < 3:
         return None
 
-    tail = [s[1] for s in segments[-8:]]
+    tail = [s[1] for s in segments[-100:]]
 
     if len(tail) >= 4 and all(tail[i] < tail[i + 1] for i in range(len(tail) - 1)):
         return f"Cầu tăng tiến {'-'.join(map(str, tail))}"
