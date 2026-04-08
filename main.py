@@ -432,7 +432,7 @@ def detect_length_signature(segments: List[Tuple[str, int]]) -> Optional[str]:
     if len(set(tail)) == 1:
         return f"Cầu nhịp đều {'-'.join(map(str, tail))}"
 
-    if len(set(tail)) >= 6:
+    if len(set(tail)) >= 5:
         return f"Cầu hỗn hợp {'-'.join(map(str, tail))}"
 
     return None
