@@ -6,12 +6,14 @@ Telegram bot Tài/Xỉu theo lịch sử, có 2 lớp:
 - History: lịch sử nhập vào, có thể reset riêng
 - Brain: bộ nhớ pattern win/lose, giữ lại khi reset history
 
-Bản này đã chỉnh:
-- Chỉ phân tích theo cầu, không dùng xu hướng nền / xu hướng gần
+Bản này:
+- Chỉ ưu tiên theo cầu (pattern)
+- Không dùng xu hướng nền / xu hướng gần
 - Bỏ delay, trả kết quả ngay
 - Reset history không đụng brain
 - Reset all mới xóa brain
 - Có /report để thống kê nhận diện cầu và brain
+- Có fallback nhẹ để không bị "im" khi không bắt được cầu rõ
 """
 
 import os
@@ -42,9 +44,6 @@ logging.basicConfig(
 logger = logging.getLogger("tai_xiu_bot")
 
 
-# =========================
-# ADMIN CHECK
-# =========================
 def is_admin(update: Update) -> bool:
     user = update.effective_user
     return bool(user and user.id == ADMIN_USER_ID)
@@ -55,9 +54,6 @@ async def deny_if_not_admin(update: Update):
         await update.message.reply_text("Bot này chỉ dành cho ADMIN.")
 
 
-# =========================
-# DB
-# =========================
 def get_conn():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -380,9 +376,6 @@ def count_brain_patterns() -> int:
     return int(row["c"]) if row else 0
 
 
-# =========================
-# PARSE
-# =========================
 TOKEN_RE = re.compile(r"\b(?:TÀI|TAI|XỈU|XIU|T|X|\d+)\b", re.UNICODE)
 
 
@@ -418,9 +411,6 @@ def fmt_outcome(v: str) -> str:
     return "Tài" if v == "T" else "Xỉu"
 
 
-# =========================
-# PATTERN HELPERS
-# =========================
 def rle(seq: List[str]) -> List[Tuple[str, int]]:
     if not seq:
         return []
@@ -723,12 +713,22 @@ def classify_pattern_pro(seq: List[str]) -> Dict[str, Any]:
         pred = last_val if last_val in {"T", "X"} else None
         return finalize(transition, pred, 70, "TRANSITION")
 
+    if len(seq) >= MIN_PREDICT_HISTORY and last_val in {"T", "X"}:
+        return {
+            "pattern_label": "Fallback đảo nhẹ",
+            "prediction": reverse_outcome(last_val),
+            "confidence": 55,
+            "recognized": True,
+            "flipped": False,
+            "flip_reason": "",
+            "follow_pct": 55,
+            "reverse_pct": 45,
+            "source": "FALLBACK",
+        }
+
     return result
 
 
-# =========================
-# OUTPUT BUILDERS
-# =========================
 def build_live_reply(
     inserted_count: int,
     total_saved: int,
@@ -843,9 +843,6 @@ def save_current_prediction_if_any(seq: List[str]) -> None:
         )
 
 
-# =========================
-# TELEGRAM HANDLERS
-# =========================
 WELCOME = (
     "Bot thống kê Tài/Xỉu đã sẵn sàng.\n\n"
     "Lệnh dùng:\n"
