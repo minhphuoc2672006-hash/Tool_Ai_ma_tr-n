@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -29,8 +28,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 DB_PATH = os.getenv("TAI_XIU_DB_PATH", "tai_xiu_stats.db")
-PREDICT_DELAY_SECONDS = 7
+PREDICT_DELAY_SECONDS = 0
 MIN_PREDICT_HISTORY = 15
+SHOW_MATRIX_OUTPUT = False
 
 _admin_raw = os.getenv("ADMIN_USER_ID", "").strip()
 try:
@@ -62,8 +62,14 @@ async def deny_if_not_admin(update: Update):
 # DB
 # =========================
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+    except Exception:
+        pass
     return conn
 
 
@@ -724,8 +730,6 @@ def build_extra_report(analysis: Dict[str, Any]) -> str:
     lines.append(f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})")
     if analysis.get("blocked"):
         lines.append(f"Chặn nhiễu: {analysis.get('block_reason', 'Đã chặn')}")
-    if analysis.get("zigzag_text"):
-        lines.append(analysis["zigzag_text"])
     return "\n".join(lines)
 
 
@@ -1032,7 +1036,6 @@ def build_live_reply(
             section5 += f"\nChặn nhiễu: {analysis.get('block_reason', '')}"
 
     extra = build_extra_report(analysis)
-    matrix = analysis.get("matrix_text", "")
 
     return (
         f"Đã lưu kết quả: +{inserted_count} | Tổng đã lưu: {total_saved}\n"
@@ -1040,8 +1043,7 @@ def build_live_reply(
         f"{section3}\n"
         f"{section4}\n"
         f"{section5}\n"
-        f"{extra}\n"
-        f"{matrix}"
+        f"{extra}"
     )
 
 
@@ -1069,8 +1071,7 @@ def build_import_reply(
             section4 += f"\nChặn nhiễu: {analysis.get('block_reason', '')}"
 
     extra = build_extra_report(analysis)
-    matrix = analysis.get("matrix_text", "")
-    return f"{section2}\n{section3}\n{section4}\n{extra}\n{matrix}"
+    return f"{section2}\n{section3}\n{section4}\n{extra}"
 
 
 def build_matrix_reply(analysis: Dict[str, Any]) -> str:
@@ -1081,8 +1082,6 @@ def build_matrix_reply(analysis: Dict[str, Any]) -> str:
             f"Tổng điểm: T={analysis.get('matrix_score_t', 0)} | X={analysis.get('matrix_score_x', 0)} | Tổng={analysis.get('matrix_total', 0)}",
             f"Độ gãy cầu: {analysis.get('break_score', 0)}/100 ({analysis.get('break_desc', 'N/A')})",
             f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})",
-            analysis.get("matrix_text", "Ma trận: Không có tín hiệu đủ mạnh"),
-            analysis.get("zigzag_text", "Bảng cầu zigzag: Chưa có dữ liệu"),
         ]
         if analysis.get("blocked"):
             out.append(f"Chặn nhiễu: {analysis.get('block_reason', '')}")
@@ -1092,8 +1091,6 @@ def build_matrix_reply(analysis: Dict[str, Any]) -> str:
         "Ma trận tổng hợp: Không dự đoán",
         f"Độ gãy cầu: {analysis.get('break_score', 0)}/100 ({analysis.get('break_desc', 'N/A')})",
         f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})",
-        analysis.get("matrix_text", "Ma trận: Không có tín hiệu đủ mạnh"),
-        analysis.get("zigzag_text", "Bảng cầu zigzag: Chưa có dữ liệu"),
     ]
     if analysis.get("blocked"):
         out.append(f"Chặn nhiễu: {analysis.get('block_reason', '')}")
@@ -1130,24 +1127,10 @@ def vip_loading_frames() -> List[str]:
 async def vip_show_loading_then_reply(update: Update, reply: str):
     if not update.message:
         return
-    status_msg = await update.message.reply_text(vip_loading_frames()[0])
-    frames = vip_loading_frames()
-    delay = max(1, PREDICT_DELAY_SECONDS // len(frames))
-    for frame in frames[1:]:
-        await asyncio.sleep(delay)
-        try:
-            await status_msg.edit_text(frame)
-        except Exception:
-            pass
-
-    remaining = PREDICT_DELAY_SECONDS - delay * (len(frames) - 1)
-    if remaining > 0:
-        await asyncio.sleep(remaining)
-
     try:
-        await status_msg.edit_text(reply)
-    except Exception:
         await update.message.reply_text(reply)
+    except Exception:
+        pass
 
 
 # =========================
