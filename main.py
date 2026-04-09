@@ -14,13 +14,18 @@ Bản này:
 - Reset all mới xóa brain
 - Có /report để thống kê nhận diện cầu và brain
 - Có fallback nhẹ để không bị "im" khi không bắt được cầu rõ
-- Không xuất kèo dự đoán
+- Chỉ báo 1 lần cho cùng một cầu
+- Có lưu vốn và báo cáo vốn
+- Cảnh báo chốt lời/ngừng lỗ theo %
+- Có /reset_lai và /reset_von
+- Không tự động vào kèo / chốt kèo
 """
 
 import os
 import re
 import sqlite3
 import logging
+from hashlib import sha1
 from collections import Counter
 from typing import List, Optional, Tuple, Dict, Any
 
@@ -29,8 +34,11 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 DB_PATH = os.getenv("TAI_XIU_DB_PATH", "tai_xiu_stats.db")
+
 MIN_HISTORY_FOR_FALLBACK = 15
 MAX_INPUT_ITEMS = 100
+BANKROLL_DEFAULT_TAKE_PROFIT_PCT = 30.0
+BANKROLL_DEFAULT_STOP_LOSS_PCT = 20.0
 
 _admin_raw = os.getenv("ADMIN_USER_ID", "").strip()
 try:
@@ -61,6 +69,12 @@ def get_conn():
     return conn
 
 
+def ensure_column_exists(conn: sqlite3.Connection, table: str, column: str, coldef: str):
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}")
+
+
 def init_db():
     with get_conn() as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -88,6 +102,54 @@ def init_db():
             )
             """
         )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_state (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                last_pattern_signature TEXT,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO bot_state(id, last_pattern_signature)
+            VALUES(1, NULL)
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bankroll (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                start_capital REAL NOT NULL DEFAULT 0,
+                current_balance REAL NOT NULL DEFAULT 0,
+                take_profit_pct REAL NOT NULL DEFAULT 30,
+                stop_loss_pct REAL NOT NULL DEFAULT 20,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO bankroll(id, start_capital, current_balance, take_profit_pct, stop_loss_pct)
+            VALUES(1, 0, 0, 30, 20)
+            """
+        )
+
+        ensure_column_exists(conn, "bankroll", "take_profit_pct", "REAL NOT NULL DEFAULT 30")
+        ensure_column_exists(conn, "bankroll", "stop_loss_pct", "REAL NOT NULL DEFAULT 20")
+
+        conn.execute(
+            """
+            UPDATE bankroll
+            SET take_profit_pct = COALESCE(take_profit_pct, 30),
+                stop_loss_pct = COALESCE(stop_loss_pct, 20)
+            WHERE id = 1
+            """
+        )
+
         conn.commit()
 
 
@@ -106,6 +168,14 @@ def save_outcomes(outcomes: List[str], raw: str) -> int:
 def reset_history_only():
     with get_conn() as conn:
         conn.execute("DELETE FROM rounds")
+        conn.execute(
+            """
+            UPDATE bot_state
+            SET last_pattern_signature = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            """
+        )
         conn.commit()
 
 
@@ -113,6 +183,25 @@ def reset_all():
     with get_conn() as conn:
         conn.execute("DELETE FROM rounds")
         conn.execute("DELETE FROM pattern_memory")
+        conn.execute(
+            """
+            UPDATE bot_state
+            SET last_pattern_signature = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            """
+        )
+        conn.execute(
+            """
+            UPDATE bankroll
+            SET start_capital = 0,
+                current_balance = 0,
+                take_profit_pct = 30,
+                stop_loss_pct = 20,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            """
+        )
         conn.commit()
 
 
@@ -138,10 +227,6 @@ def count_saved_rounds() -> int:
     with get_conn() as conn:
         row = conn.execute("SELECT COUNT(*) AS c FROM rounds").fetchone()
     return int(row["c"]) if row else 0
-
-
-def reverse_outcome(v: str) -> str:
-    return "T" if v == "X" else "X"
 
 
 def pattern_family(label: str) -> str:
@@ -191,65 +276,6 @@ def pattern_family(label: str) -> str:
     return "OTHER"
 
 
-def get_pattern_memory(pattern_key: str) -> Optional[Dict[str, int]]:
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT wins, losses, recent_losses
-            FROM pattern_memory
-            WHERE pattern_key = ?
-            """,
-            (pattern_key,),
-        ).fetchone()
-    if not row:
-        return None
-    return {
-        "wins": int(row["wins"]),
-        "losses": int(row["losses"]),
-        "recent_losses": int(row["recent_losses"]),
-    }
-
-
-def update_pattern_memory_in_conn(conn: sqlite3.Connection, pattern_key: str, strong: bool):
-    row = conn.execute(
-        """
-        SELECT wins, losses, recent_losses
-        FROM pattern_memory
-        WHERE pattern_key = ?
-        """,
-        (pattern_key,),
-    ).fetchone()
-
-    if row:
-        wins = int(row["wins"])
-        losses = int(row["losses"])
-        recent_losses = int(row["recent_losses"])
-    else:
-        wins = 0
-        losses = 0
-        recent_losses = 0
-
-    if strong:
-        wins += 1
-        recent_losses = 0
-    else:
-        losses += 1
-        recent_losses += 1
-
-    conn.execute(
-        """
-        INSERT INTO pattern_memory(pattern_key, wins, losses, recent_losses, updated_at)
-        VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(pattern_key) DO UPDATE SET
-            wins = excluded.wins,
-            losses = excluded.losses,
-            recent_losses = excluded.recent_losses,
-            updated_at = CURRENT_TIMESTAMP
-        """,
-        (pattern_key, wins, losses, recent_losses),
-    )
-
-
 def get_brain_rows(limit: int = 10):
     with get_conn() as conn:
         rows = conn.execute(
@@ -283,6 +309,170 @@ def get_brain_totals() -> Tuple[int, int]:
     strong_hits = int(row["strong_hits"]) if row else 0
     weak_hits = int(row["weak_hits"]) if row else 0
     return strong_hits, weak_hits
+
+
+def get_last_pattern_signature() -> Optional[str]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT last_pattern_signature FROM bot_state WHERE id = 1"
+        ).fetchone()
+    if not row:
+        return None
+    return row["last_pattern_signature"]
+
+
+def set_last_pattern_signature(signature: str):
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE bot_state
+            SET last_pattern_signature = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            """,
+            (signature,),
+        )
+        conn.commit()
+
+
+def set_bankroll(
+    start_capital: float,
+    take_profit_pct: float = BANKROLL_DEFAULT_TAKE_PROFIT_PCT,
+    stop_loss_pct: float = BANKROLL_DEFAULT_STOP_LOSS_PCT,
+):
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE bankroll
+            SET start_capital = ?,
+                current_balance = ?,
+                take_profit_pct = ?,
+                stop_loss_pct = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            """,
+            (start_capital, start_capital, take_profit_pct, stop_loss_pct),
+        )
+        conn.commit()
+
+
+def add_bankroll(delta: float):
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE bankroll
+            SET current_balance = current_balance + ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            """,
+            (delta,),
+        )
+        conn.commit()
+
+
+def reset_profit_only():
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT start_capital FROM bankroll WHERE id = 1"
+        ).fetchone()
+        start_capital = float(row["start_capital"]) if row else 0.0
+        conn.execute(
+            """
+            UPDATE bankroll
+            SET current_balance = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            """,
+            (start_capital,),
+        )
+        conn.commit()
+
+
+def reset_capital_only():
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE bankroll
+            SET start_capital = 0,
+                current_balance = 0,
+                take_profit_pct = 30,
+                stop_loss_pct = 20,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = 1
+            """
+        )
+        conn.commit()
+
+
+def get_bankroll() -> Dict[str, float]:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT start_capital, current_balance, take_profit_pct, stop_loss_pct
+            FROM bankroll
+            WHERE id = 1
+            """
+        ).fetchone()
+
+    if not row:
+        return {
+            "start_capital": 0.0,
+            "current_balance": 0.0,
+            "take_profit_pct": BANKROLL_DEFAULT_TAKE_PROFIT_PCT,
+            "stop_loss_pct": BANKROLL_DEFAULT_STOP_LOSS_PCT,
+        }
+
+    return {
+        "start_capital": float(row["start_capital"]),
+        "current_balance": float(row["current_balance"]),
+        "take_profit_pct": float(row["take_profit_pct"]),
+        "stop_loss_pct": float(row["stop_loss_pct"]),
+    }
+
+
+def bankroll_state() -> Dict[str, Any]:
+    b = get_bankroll()
+    start = b["start_capital"]
+    current = b["current_balance"]
+    tp = b["take_profit_pct"]
+    sl = b["stop_loss_pct"]
+
+    profit = current - start
+    profit_pct = (profit / start * 100.0) if start > 0 else 0.0
+
+    status = "CHƯA NHẬP VỐN"
+    action = "Nhập /bankroll_set trước để bắt đầu."
+    if start > 0:
+        if profit_pct >= tp:
+            status = "CHỐT LỜI"
+            action = f"Đã đạt mục tiêu +{tp:.1f}%."
+        elif profit_pct <= -sl:
+            status = "NGỪNG LỖ"
+            action = f"Đã chạm ngưỡng -{sl:.1f}%."
+        else:
+            status = "ĐANG CHẠY"
+            action = "Chưa chạm ngưỡng chốt/dừng."
+
+    return {
+        **b,
+        "profit": profit,
+        "profit_pct": profit_pct,
+        "status": status,
+        "action": action,
+    }
+
+
+def format_bankroll_report() -> str:
+    s = bankroll_state()
+    return (
+        f"Vốn ban đầu: {s['start_capital']:.0f}\n"
+        f"Số dư hiện tại: {s['current_balance']:.0f}\n"
+        f"Lãi/Lỗ: {s['profit']:+.0f} ({s['profit_pct']:+.1f}%)\n"
+        f"Ngưỡng chốt lời: +{s['take_profit_pct']:.1f}%\n"
+        f"Ngưỡng ngừng lỗ: -{s['stop_loss_pct']:.1f}%\n"
+        f"Trạng thái: {s['status']}\n"
+        f"Gợi ý: {s['action']}"
+    )
 
 
 TOKEN_RE = re.compile(r"\b(?:TÀI|TAI|XỈU|XIU|T|X|\d+)\b", re.UNICODE)
@@ -731,6 +921,31 @@ def classify_pattern_pro(seq: List[str]) -> Dict[str, Any]:
     return result
 
 
+def build_pattern_signature(seq: List[str], analysis: Dict[str, Any]) -> str:
+    window = seq[-20:]
+    segs = rle(window)
+    tail_seq = "".join(window[-10:])
+    tail_seg = "-".join(f"{v}{n}" for v, n in segs[-6:])
+    family = analysis.get("family", "OTHER")
+    label = analysis.get("pattern_label", "")
+    raw = f"{family}|{label}|{tail_seq}|{tail_seg}"
+    return sha1(raw.encode("utf-8")).hexdigest()
+
+
+def should_emit_pattern_once(seq: List[str], analysis: Dict[str, Any]) -> bool:
+    if not analysis.get("recognized"):
+        return False
+
+    signature = build_pattern_signature(seq, analysis)
+    last_signature = get_last_pattern_signature()
+
+    if last_signature == signature:
+        return False
+
+    set_last_pattern_signature(signature)
+    return True
+
+
 def update_brain_from_analysis(analysis: Dict[str, Any]):
     if not analysis.get("recognized"):
         return
@@ -763,11 +978,20 @@ def build_live_reply(
     analysis: Dict[str, Any],
     brain_strong: int,
     brain_weak: int,
+    emit_once: bool,
 ) -> str:
+    if analysis["recognized"] and not emit_once:
+        pattern_text = f"Cầu: {analysis['pattern_label']}\nĐã ghi nhận cầu này, chờ cầu mới."
+    else:
+        pattern_text = format_pattern_summary(analysis)
+
+    bankroll_text = format_bankroll_report()
+
     return (
         f"Đã lưu kết quả: +{inserted_count} | Tổng đã lưu: {total_saved}\n"
         f"Brain: Ổn định {brain_strong} | Nhiễu {brain_weak}\n"
-        f"{format_pattern_summary(analysis)}"
+        f"{bankroll_text}\n\n"
+        f"{pattern_text}"
     )
 
 
@@ -778,7 +1002,8 @@ def build_import_reply(
 ) -> str:
     return (
         f"Đã lưu kết quả: +{inserted_count} | Tổng đã lưu: {total_saved}\n"
-        f"{format_pattern_summary(analysis)}"
+        f"{format_pattern_summary(analysis)}\n\n"
+        f"{format_bankroll_report()}"
     )
 
 
@@ -807,6 +1032,8 @@ def build_report_reply(seq: List[str], analysis: Dict[str, Any]) -> str:
         f"{format_pattern_summary(analysis)}\n"
         f"\nNão (top pattern):\n"
         + "\n".join(brain_lines)
+        + "\n\n"
+        + format_bankroll_report()
     )
 
 
@@ -821,6 +1048,11 @@ WELCOME = (
     "/patterns [n]           - xem nhận diện cầu\n"
     "/brain [n]              - xem bộ nhớ não\n"
     "/report [n]             - thống kê nhận diện cầu\n"
+    "/bankroll_set <vốn> [tp%] [sl%] - lưu vốn và ngưỡng chốt/dừng\n"
+    "/bankroll_add <số>      - cộng/trừ số dư thủ công\n"
+    "/bankroll_report        - xem vốn hiện tại\n"
+    "/reset_lai              - reset lãi, giữ vốn gốc\n"
+    "/reset_von              - reset toàn bộ vốn\n"
     "/clear, /reset_history  - xóa lịch sử\n"
     "/reset_all              - xóa toàn bộ, gồm cả não\n\n"
     "Chỉ ADMIN mới dùng được."
@@ -852,6 +1084,7 @@ async def process_live_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
         seq = load_history(200)
         analysis = classify_pattern_pro(seq)
         update_brain_from_analysis(analysis)
+        emit_once = should_emit_pattern_once(seq, analysis)
         total_saved = count_saved_rounds()
         brain_strong, brain_weak = get_brain_totals()
 
@@ -861,6 +1094,7 @@ async def process_live_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
             analysis=analysis,
             brain_strong=brain_strong,
             brain_weak=brain_weak,
+            emit_once=emit_once,
         )
         await update.message.reply_text(reply)
 
@@ -1062,6 +1296,86 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(reply)
 
 
+async def bankroll_set_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return await deny_if_not_admin(update)
+    if not update.message:
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Dùng: /bankroll_set <vốn> [take_profit_%] [stop_loss_%]\n"
+            "Ví dụ: /bankroll_set 1000000 30 20"
+        )
+        return
+
+    try:
+        start_capital = float(context.args[0])
+        take_profit_pct = float(context.args[1]) if len(context.args) >= 2 else BANKROLL_DEFAULT_TAKE_PROFIT_PCT
+        stop_loss_pct = float(context.args[2]) if len(context.args) >= 3 else BANKROLL_DEFAULT_STOP_LOSS_PCT
+    except ValueError:
+        await update.message.reply_text("Giá trị vốn hoặc % không hợp lệ.")
+        return
+
+    set_bankroll(start_capital, take_profit_pct, stop_loss_pct)
+    await update.message.reply_text(format_bankroll_report())
+
+
+async def bankroll_add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return await deny_if_not_admin(update)
+    if not update.message:
+        return
+
+    if not context.args:
+        await update.message.reply_text("Dùng: /bankroll_add <số tiền +/- >")
+        return
+
+    try:
+        delta = float(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Giá trị không hợp lệ.")
+        return
+
+    add_bankroll(delta)
+    await update.message.reply_text(format_bankroll_report())
+
+
+async def bankroll_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return await deny_if_not_admin(update)
+    if update.message:
+        await update.message.reply_text(format_bankroll_report())
+
+
+async def bankroll_reset_profit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return await deny_if_not_admin(update)
+    if not update.message:
+        return
+
+    reset_profit_only()
+    await update.message.reply_text(
+        "Đã reset lãi.\n"
+        "Vốn gốc vẫn giữ nguyên.\n\n"
+        + format_bankroll_report()
+    )
+
+
+async def bankroll_reset_capital_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return await deny_if_not_admin(update)
+    if not update.message:
+        return
+
+    reset_capital_only()
+    await update.message.reply_text(
+        "Đã reset vốn.\n"
+        "Toàn bộ mốc tính lại từ đầu.\n\n"
+        + format_bankroll_report()
+    )
+
+
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return await deny_if_not_admin(update)
@@ -1086,7 +1400,7 @@ async def reset_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     reset_all()
-    await update.message.reply_text("Đã xóa toàn bộ: lịch sử và não.")
+    await update.message.reply_text("Đã xóa toàn bộ: lịch sử, não, và vốn.")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1117,6 +1431,15 @@ def main():
     app.add_handler(CommandHandler("patterns", patterns_cmd))
     app.add_handler(CommandHandler("brain", brain_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
+
+    app.add_handler(CommandHandler("bankroll_set", bankroll_set_cmd))
+    app.add_handler(CommandHandler("bankroll_add", bankroll_add_cmd))
+    app.add_handler(CommandHandler("bankroll_report", bankroll_report_cmd))
+    app.add_handler(CommandHandler("reset_lai", bankroll_reset_profit_cmd))
+    app.add_handler(CommandHandler("reset_von", bankroll_reset_capital_cmd))
+    app.add_handler(CommandHandler("bankroll_reset_profit", bankroll_reset_profit_cmd))
+    app.add_handler(CommandHandler("bankroll_reset_capital", bankroll_reset_capital_cmd))
+
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CommandHandler("reset_history", reset_history_cmd))
     app.add_handler(CommandHandler("reset_all", reset_all_cmd))
