@@ -30,7 +30,6 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 DB_PATH = os.getenv("TAI_XIU_DB_PATH", "tai_xiu_stats.db")
 PREDICT_DELAY_SECONDS = 0
 MIN_PREDICT_HISTORY = 15
-SHOW_MATRIX_OUTPUT = False
 
 _admin_raw = os.getenv("ADMIN_USER_ID", "").strip()
 try:
@@ -43,6 +42,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("tai_xiu_bot")
+DB_IO_LOCK = asyncio.Lock()
 
 
 # =========================
@@ -62,14 +62,10 @@ async def deny_if_not_admin(update: Update):
 # DB
 # =========================
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=30000")
-    except Exception:
-        pass
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
     return conn
 
 
@@ -730,6 +726,8 @@ def build_extra_report(analysis: Dict[str, Any]) -> str:
     lines.append(f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})")
     if analysis.get("blocked"):
         lines.append(f"Chặn nhiễu: {analysis.get('block_reason', 'Đã chặn')}")
+    if analysis.get("zigzag_text"):
+        lines.append(analysis["zigzag_text"])
     return "\n".join(lines)
 
 
@@ -1028,22 +1026,15 @@ def build_live_reply(
         )
         if analysis["flipped"]:
             section5 += f"\nĐã bẻ: {analysis['flip_reason']}"
-        if analysis.get("blocked"):
-            section5 += f"\nChặn nhiễu: {analysis.get('block_reason', '')}"
     else:
         section5 = "Dự đoán mới: Không dự đoán"
-        if analysis.get("blocked"):
-            section5 += f"\nChặn nhiễu: {analysis.get('block_reason', '')}"
-
-    extra = build_extra_report(analysis)
 
     return (
         f"Đã lưu kết quả: +{inserted_count} | Tổng đã lưu: {total_saved}\n"
         f"{section2}\n"
         f"{section3}\n"
         f"{section4}\n"
-        f"{section5}\n"
-        f"{extra}"
+        f"{section5}"
     )
 
 
@@ -1063,15 +1054,10 @@ def build_import_reply(
         )
         if analysis["flipped"]:
             section4 += f"\nĐã bẻ: {analysis['flip_reason']}"
-        if analysis.get("blocked"):
-            section4 += f"\nChặn nhiễu: {analysis.get('block_reason', '')}"
     else:
         section4 = "Dự đoán mới: Không dự đoán"
-        if analysis.get("blocked"):
-            section4 += f"\nChặn nhiễu: {analysis.get('block_reason', '')}"
 
-    extra = build_extra_report(analysis)
-    return f"{section2}\n{section3}\n{section4}\n{extra}"
+    return f"{section2}\n{section3}\n{section4}"
 
 
 def build_matrix_reply(analysis: Dict[str, Any]) -> str:
@@ -1082,6 +1068,8 @@ def build_matrix_reply(analysis: Dict[str, Any]) -> str:
             f"Tổng điểm: T={analysis.get('matrix_score_t', 0)} | X={analysis.get('matrix_score_x', 0)} | Tổng={analysis.get('matrix_total', 0)}",
             f"Độ gãy cầu: {analysis.get('break_score', 0)}/100 ({analysis.get('break_desc', 'N/A')})",
             f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})",
+            analysis.get("matrix_text", "Ma trận: Không có tín hiệu đủ mạnh"),
+            analysis.get("zigzag_text", "Bảng cầu zigzag: Chưa có dữ liệu"),
         ]
         if analysis.get("blocked"):
             out.append(f"Chặn nhiễu: {analysis.get('block_reason', '')}")
@@ -1091,6 +1079,8 @@ def build_matrix_reply(analysis: Dict[str, Any]) -> str:
         "Ma trận tổng hợp: Không dự đoán",
         f"Độ gãy cầu: {analysis.get('break_score', 0)}/100 ({analysis.get('break_desc', 'N/A')})",
         f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})",
+        analysis.get("matrix_text", "Ma trận: Không có tín hiệu đủ mạnh"),
+        analysis.get("zigzag_text", "Bảng cầu zigzag: Chưa có dữ liệu"),
     ]
     if analysis.get("blocked"):
         out.append(f"Chặn nhiễu: {analysis.get('block_reason', '')}")
@@ -1144,8 +1134,8 @@ WELCOME = (
     "/history [n]            - xem n kết quả gần nhất\n"
     "/stats [n]              - thống kê tần suất\n"
     "/scan [n]               - phân tích lịch sử\n"
-    "/patterns [n]           - xem nhận diện cầu\n"
-    "/matrix [n]             - xem ma trận tổng hợp + zigzag\n"
+
+
     "/brain [n]              - xem bộ nhớ não\n"
     "/clear, /reset_history  - xóa lịch sử + kèo chờ, giữ não\n"
     "/reset_all              - xóa toàn bộ, gồm cả não\n\n"
@@ -1168,14 +1158,15 @@ async def process_live_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text("Không tìm thấy dữ liệu hợp lệ.")
         return
 
-    inserted = save_outcomes(items, text)
-    resolved = resolve_pending_predictions(items)
-    latest_resolution = resolved[-1] if resolved else get_latest_resolution()
-    seq = load_history(200)
-    analysis = classify_pattern_pro(seq)
-    save_current_prediction_if_any(seq)
-    total_saved = count_saved_rounds()
-    wins, losses = get_prediction_stats()
+    async with DB_IO_LOCK:
+        inserted = save_outcomes(items, text)
+        resolved = resolve_pending_predictions(items)
+        latest_resolution = resolved[-1] if resolved else get_latest_resolution()
+        seq = load_history(200)
+        analysis = classify_pattern_pro(seq)
+        save_current_prediction_if_any(seq)
+        total_saved = count_saved_rounds()
+        wins, losses = get_prediction_stats()
 
     reply = build_live_reply(
         inserted_count=inserted,
@@ -1185,7 +1176,8 @@ async def process_live_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
         losses=losses,
         analysis=analysis,
     )
-    await vip_show_loading_then_reply(update, reply)
+    if update.message:
+        await update.message.reply_text(reply)
 
 
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1215,10 +1207,11 @@ async def import_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Không tìm thấy dữ liệu hợp lệ.")
         return
 
-    inserted = save_outcomes(items, text)
-    seq = load_history(200)
-    analysis = classify_pattern_pro(seq)
-    total_saved = count_saved_rounds()
+    async with DB_IO_LOCK:
+        inserted = save_outcomes(items, text)
+        seq = load_history(200)
+        analysis = classify_pattern_pro(seq)
+        total_saved = count_saved_rounds()
 
     reply = build_import_reply(
         inserted_count=inserted,
@@ -1293,32 +1286,17 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if analysis["recognized"] and analysis["prediction"] in {"T", "X"} and len(seq) >= MIN_PREDICT_HISTORY:
         msg = (
             f"Cầu: {analysis['pattern_label']}\n"
-            f"Vào: {fmt_outcome(analysis['prediction'])} | Độ tin cậy: {analysis['confidence']}%\n"
-            f"Tỷ lệ: Theo {analysis['follow_pct']}% | Bẻ {analysis['reverse_pct']}%\n"
-            f"Độ gãy cầu: {analysis.get('break_score', 0)}/100\n"
-            f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100"
+            f"Vào: {fmt_outcome(analysis['prediction'])} | Độ tin cậy: {analysis['confidence']}%"
         )
         if analysis["flipped"]:
             msg += f"\nĐã bẻ: {analysis['flip_reason']}"
-        if analysis.get("blocked"):
-            msg += f"\nChặn nhiễu: {analysis.get('block_reason', '')}"
     elif analysis["recognized"]:
         msg = (
             f"Cầu: {analysis['pattern_label']}\n"
-            f"Vào: Không dự đoán\n"
-            f"Độ gãy cầu: {analysis.get('break_score', 0)}/100\n"
-            f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100"
+            f"Vào: Không dự đoán"
         )
-        if analysis.get("blocked"):
-            msg += f"\nChặn nhiễu: {analysis.get('block_reason', '')}"
     else:
-        msg = (
-            "Cầu: Không nhận diện được cầu\n"
-            f"Độ gãy cầu: {analysis.get('break_score', 0)}/100\n"
-            f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100"
-        )
-        if analysis.get("blocked"):
-            msg += f"\nChặn nhiễu: {analysis.get('block_reason', '')}"
+        msg = "Cầu: Không nhận diện được cầu"
 
     await update.message.reply_text(msg)
 
@@ -1328,57 +1306,7 @@ async def patterns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await deny_if_not_admin(update)
     if not update.message:
         return
-
-    n = 160
-    if context.args and context.args[0].isdigit():
-        n = max(20, min(2000, int(context.args[0])))
-
-    seq = load_history(n)
-    if not seq:
-        await update.message.reply_text("Chưa có dữ liệu.")
-        return
-
-    analysis = classify_pattern_pro(seq)
-    segs = rle(seq[-n:])
-    seg_text = " ".join(f"{v}{k}" for v, k in segs[-12:])
-
-    if analysis["recognized"] and analysis["prediction"] in {"T", "X"} and len(seq) >= MIN_PREDICT_HISTORY:
-        reply = (
-            f"Nhận diện: {analysis['pattern_label']}\n"
-            f"Chuỗi segment: {seg_text}\n"
-            f"Vào: {fmt_outcome(analysis['prediction'])} | Độ tin cậy: {analysis['confidence']}%\n"
-            f"Tỷ lệ: Theo {analysis['follow_pct']}% | Bẻ {analysis['reverse_pct']}%\n"
-            f"Độ gãy cầu: {analysis.get('break_score', 0)}/100 ({analysis.get('break_desc', 'N/A')})\n"
-            f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})\n"
-            f"Tổng điểm: T={analysis.get('matrix_score_t', 0)} | X={analysis.get('matrix_score_x', 0)}"
-        )
-        if analysis["flipped"]:
-            reply += f"\nĐã bẻ: {analysis['flip_reason']}"
-        if analysis.get("blocked"):
-            reply += f"\nChặn nhiễu: {analysis.get('block_reason', '')}"
-    elif analysis["recognized"]:
-        reply = (
-            f"Nhận diện: {analysis['pattern_label']}\n"
-            f"Chuỗi segment: {seg_text}\n"
-            f"Vào: Không dự đoán\n"
-            f"Độ gãy cầu: {analysis.get('break_score', 0)}/100 ({analysis.get('break_desc', 'N/A')})\n"
-            f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})\n"
-            f"Tổng điểm: T={analysis.get('matrix_score_t', 0)} | X={analysis.get('matrix_score_x', 0)}"
-        )
-        if analysis.get("blocked"):
-            reply += f"\nChặn nhiễu: {analysis.get('block_reason', '')}"
-    else:
-        reply = (
-            "Nhận diện: Không nhận diện được cầu\n"
-            f"Chuỗi segment: {seg_text}\n"
-            f"Độ gãy cầu: {analysis.get('break_score', 0)}/100 ({analysis.get('break_desc', 'N/A')})\n"
-            f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})\n"
-            f"Tổng điểm: T={analysis.get('matrix_score_t', 0)} | X={analysis.get('matrix_score_x', 0)}"
-        )
-        if analysis.get("blocked"):
-            reply += f"\nChặn nhiễu: {analysis.get('block_reason', '')}"
-
-    await update.message.reply_text(reply)
+    await update.message.reply_text("Chức năng bảng cầu đã được ẩn.")
 
 
 async def matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1386,19 +1314,7 @@ async def matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await deny_if_not_admin(update)
     if not update.message:
         return
-
-    n = 200
-    if context.args and context.args[0].isdigit():
-        n = max(20, min(2000, int(context.args[0])))
-
-    seq = load_history(n)
-    if not seq:
-        await update.message.reply_text("Chưa có dữ liệu.")
-        return
-
-    analysis = classify_pattern_pro(seq)
-    reply = build_matrix_reply(analysis)
-    await update.message.reply_text(reply)
+    await update.message.reply_text("Chức năng ma trận đã được ẩn.")
 
 
 async def brain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1436,7 +1352,8 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await deny_if_not_admin(update)
     if not update.message:
         return
-    reset_history_only()
+    async with DB_IO_LOCK:
+        reset_history_only()
     await update.message.reply_text("Đã xóa toàn bộ lịch sử và kèo chờ. Não vẫn được giữ lại.")
 
 
@@ -1445,7 +1362,8 @@ async def reset_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await deny_if_not_admin(update)
     if not update.message:
         return
-    reset_history_only()
+    async with DB_IO_LOCK:
+        reset_history_only()
     await update.message.reply_text("Đã reset lịch sử. Não vẫn được giữ lại.")
 
 
@@ -1454,7 +1372,8 @@ async def reset_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await deny_if_not_admin(update)
     if not update.message:
         return
-    reset_all()
+    async with DB_IO_LOCK:
+        reset_all()
     await update.message.reply_text("Đã xóa toàn bộ: lịch sử, kèo chờ và não.")
 
 
