@@ -6,14 +6,18 @@ Telegram bot Tài/Xỉu theo lịch sử, có 2 lớp:
 - History: lịch sử nhập vào, có thể reset riêng
 - Brain: bộ nhớ pattern win/lose, giữ lại khi reset history
 
-Lưu ý: đây là bot thống kê / phân tích pattern, không thể đảm bảo kết quả.
+Bản này đã chỉnh:
+- Chỉ phân tích theo cầu, không dùng xu hướng nền / xu hướng gần
+- Bỏ delay, trả kết quả ngay
+- Reset history không đụng brain
+- Reset all mới xóa brain
+- Có /report để thống kê nhận diện cầu và brain
 """
 
 import os
 import re
 import sqlite3
 import logging
-import asyncio
 from collections import Counter
 from typing import List, Optional, Tuple, Dict, Any
 
@@ -22,8 +26,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 DB_PATH = os.getenv("TAI_XIU_DB_PATH", "tai_xiu_stats.db")
-PREDICT_DELAY_SECONDS = 7
 MIN_PREDICT_HISTORY = 15
+MAX_INPUT_ITEMS = 100
 
 _admin_raw = os.getenv("ADMIN_USER_ID", "").strip()
 try:
@@ -55,13 +59,16 @@ async def deny_if_not_admin(update: Update):
 # DB
 # =========================
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
     with get_conn() as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS rounds (
@@ -72,6 +79,7 @@ def init_db():
             )
             """
         )
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS predictions (
@@ -88,6 +96,7 @@ def init_db():
             )
             """
         )
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS pattern_memory (
@@ -165,20 +174,6 @@ def save_prediction(pattern: str, predicted_outcome: str, confidence: int, based
         conn.commit()
 
 
-def has_pending_prediction_for_count(based_on_count: int) -> bool:
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT 1
-            FROM predictions
-            WHERE resolved = 0 AND based_on_count = ?
-            LIMIT 1
-            """,
-            (based_on_count,),
-        ).fetchone()
-    return row is not None
-
-
 def reverse_outcome(v: str) -> str:
     return "T" if v == "X" else "X"
 
@@ -217,10 +212,6 @@ def pattern_family(label: str) -> str:
         return "BE_CAU"
     if t.startswith("Chuyển"):
         return "CHUYEN_CAU"
-    if t.startswith("Xu hướng gần"):
-        return "XU_HUONG_GAN"
-    if t.startswith("Xu hướng nền"):
-        return "XU_HUONG_NEN"
     return "OTHER"
 
 
@@ -243,46 +234,44 @@ def get_pattern_memory(pattern_key: str) -> Optional[Dict[str, int]]:
     }
 
 
-def update_pattern_memory(pattern_key: str, correct: bool):
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT wins, losses, recent_losses
-            FROM pattern_memory
-            WHERE pattern_key = ?
-            """,
-            (pattern_key,),
-        ).fetchone()
+def update_pattern_memory_in_conn(conn: sqlite3.Connection, pattern_key: str, correct: bool):
+    row = conn.execute(
+        """
+        SELECT wins, losses, recent_losses
+        FROM pattern_memory
+        WHERE pattern_key = ?
+        """,
+        (pattern_key,),
+    ).fetchone()
 
-        if row:
-            wins = int(row["wins"])
-            losses = int(row["losses"])
-            recent_losses = int(row["recent_losses"])
-        else:
-            wins = 0
-            losses = 0
-            recent_losses = 0
+    if row:
+        wins = int(row["wins"])
+        losses = int(row["losses"])
+        recent_losses = int(row["recent_losses"])
+    else:
+        wins = 0
+        losses = 0
+        recent_losses = 0
 
-        if correct:
-            wins += 1
-            recent_losses = 0
-        else:
-            losses += 1
-            recent_losses += 1
+    if correct:
+        wins += 1
+        recent_losses = 0
+    else:
+        losses += 1
+        recent_losses += 1
 
-        conn.execute(
-            """
-            INSERT INTO pattern_memory(pattern_key, wins, losses, recent_losses, updated_at)
-            VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(pattern_key) DO UPDATE SET
-                wins = excluded.wins,
-                losses = excluded.losses,
-                recent_losses = excluded.recent_losses,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (pattern_key, wins, losses, recent_losses),
-        )
-        conn.commit()
+    conn.execute(
+        """
+        INSERT INTO pattern_memory(pattern_key, wins, losses, recent_losses, updated_at)
+        VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(pattern_key) DO UPDATE SET
+            wins = excluded.wins,
+            losses = excluded.losses,
+            recent_losses = excluded.recent_losses,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (pattern_key, wins, losses, recent_losses),
+    )
 
 
 def resolve_pending_predictions(actual_outcomes: List[str]) -> List[Dict[str, Any]]:
@@ -323,7 +312,7 @@ def resolve_pending_predictions(actual_outcomes: List[str]) -> List[Dict[str, An
                     "confidence": int(pred_row["confidence"]),
                 }
             )
-            update_pattern_memory(pattern_family(pred_row["pattern"]), bool(correct))
+            update_pattern_memory_in_conn(conn, pattern_family(pred_row["pattern"]), bool(correct))
 
         conn.commit()
 
@@ -590,18 +579,6 @@ def detect_transition_pro(segments: List[Tuple[str, int]]) -> Optional[str]:
     return None
 
 
-def weighted_trend(seq: List[str], window: int = 20) -> Tuple[Optional[str], int]:
-    tail = seq[-window:]
-    if not tail:
-        return None, 0
-    score = 0
-    for i, v in enumerate(reversed(tail)):
-        w = i + 1
-        score += w if v == "T" else -w
-    trend = "T" if score > 0 else "X"
-    return trend, abs(score)
-
-
 def adjust_prediction_by_memory(pattern_label: str, predicted_outcome: Optional[str], confidence: int) -> Tuple[Optional[str], int, bool, str]:
     if not pattern_label or predicted_outcome not in {"T", "X"}:
         return predicted_outcome, confidence, False, "NO_MEMORY"
@@ -746,16 +723,6 @@ def classify_pattern_pro(seq: List[str]) -> Dict[str, Any]:
         pred = last_val if last_val in {"T", "X"} else None
         return finalize(transition, pred, 70, "TRANSITION")
 
-    trend, strength = weighted_trend(window, window=20)
-    if trend and strength >= 15:
-        return finalize(f"Xu hướng gần {trend}", trend, 60, "WEIGHTED_TREND")
-
-    count_T = window.count("T")
-    count_X = window.count("X")
-    if abs(count_T - count_X) >= 3:
-        base = "T" if count_T > count_X else "X"
-        return finalize(f"Xu hướng nền {base}", base, 58, "BASE_TREND")
-
     return result
 
 
@@ -827,11 +794,43 @@ def build_import_reply(
     return f"{section2}\n{section3}\n{section4}"
 
 
+def build_report_reply(seq: List[str], analysis: Dict[str, Any]) -> str:
+    count = Counter(seq)
+    total = len(seq)
+
+    brain_rows = get_brain_rows(8)
+    brain_lines = []
+    if brain_rows:
+        for r in brain_rows:
+            total_p = int(r["wins"]) + int(r["losses"])
+            win_rate = (int(r["wins"]) / total_p * 100) if total_p else 0.0
+            brain_lines.append(
+                f"- {r['pattern_key']} | W:{r['wins']} L:{r['losses']} | LR:{r['recent_losses']} | {win_rate:.1f}%"
+            )
+    else:
+        brain_lines.append("- Chưa có dữ liệu não.")
+
+    if analysis["recognized"] and analysis["prediction"] in {"T", "X"}:
+        predict_text = f"{fmt_outcome(analysis['prediction'])} ({analysis['confidence']}%)"
+    elif analysis["recognized"]:
+        predict_text = "Không dự đoán"
+    else:
+        predict_text = "Không nhận diện được cầu"
+
+    return (
+        f"Thống kê tổng: {total} mẫu\n"
+        f"- Tài: {count['T']}\n"
+        f"- Xỉu: {count['X']}\n"
+        f"\nCầu hiện tại:\n"
+        f"- {analysis['pattern_label']}\n"
+        f"- Dự đoán: {predict_text}\n"
+        f"\nNão (top pattern):\n"
+        + "\n".join(brain_lines)
+    )
+
+
 def save_current_prediction_if_any(seq: List[str]) -> None:
-    current_count = len(seq)
-    if current_count < MIN_PREDICT_HISTORY:
-        return
-    if has_pending_prediction_for_count(current_count):
+    if len(seq) < MIN_PREDICT_HISTORY:
         return
 
     analysis = classify_pattern_pro(seq)
@@ -840,41 +839,8 @@ def save_current_prediction_if_any(seq: List[str]) -> None:
             pattern=analysis["pattern_label"],
             predicted_outcome=analysis["prediction"],
             confidence=analysis["confidence"],
-            based_on_count=current_count,
+            based_on_count=len(seq),
         )
-
-
-def vip_loading_frames() -> List[str]:
-    return [
-        "🔍 Đang quét dữ liệu...\nTiến độ: 20%",
-        "📊 Phân tích cầu...\nTiến độ: 40%",
-        "🧠 AI đang tính toán...\nTiến độ: 60%",
-        "📈 Đánh giá độ tin cậy...\nTiến độ: 80%",
-        "✅ Hoàn tất phân tích...\nTiến độ: 100%",
-    ]
-
-
-async def vip_show_loading_then_reply(update: Update, reply: str):
-    if not update.message:
-        return
-    status_msg = await update.message.reply_text(vip_loading_frames()[0])
-    frames = vip_loading_frames()
-    delay = max(1, PREDICT_DELAY_SECONDS // len(frames))
-    for frame in frames[1:]:
-        await asyncio.sleep(delay)
-        try:
-            await status_msg.edit_text(frame)
-        except Exception:
-            pass
-
-    remaining = PREDICT_DELAY_SECONDS - delay * (len(frames) - 1)
-    if remaining > 0:
-        await asyncio.sleep(remaining)
-
-    try:
-        await status_msg.edit_text(reply)
-    except Exception:
-        await update.message.reply_text(reply)
 
 
 # =========================
@@ -890,6 +856,7 @@ WELCOME = (
     "/scan [n]               - phân tích lịch sử\n"
     "/patterns [n]           - xem nhận diện cầu\n"
     "/brain [n]              - xem bộ nhớ não\n"
+    "/report [n]             - thống kê nhận diện cầu\n"
     "/clear, /reset_history  - xóa lịch sử + kèo chờ, giữ não\n"
     "/reset_all              - xóa toàn bộ, gồm cả não\n\n"
     "Chỉ ADMIN mới dùng được."
@@ -904,31 +871,47 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def process_live_input(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    if not update.message:
-        return
-    items = extract_outcomes(text)
-    if not items:
-        await update.message.reply_text("Không tìm thấy dữ liệu hợp lệ.")
-        return
+    try:
+        if not update.message:
+            return
 
-    inserted = save_outcomes(items, text)
-    resolved = resolve_pending_predictions(items)
-    latest_resolution = resolved[-1] if resolved else get_latest_resolution()
-    seq = load_history(200)
-    analysis = classify_pattern_pro(seq)
-    save_current_prediction_if_any(seq)
-    total_saved = count_saved_rounds()
-    wins, losses = get_prediction_stats()
+        items = extract_outcomes(text)
+        if not items:
+            await update.message.reply_text("Không tìm thấy dữ liệu hợp lệ.")
+            return
 
-    reply = build_live_reply(
-        inserted_count=inserted,
-        total_saved=total_saved,
-        latest_resolution=latest_resolution,
-        wins=wins,
-        losses=losses,
-        analysis=analysis,
-    )
-    await vip_show_loading_then_reply(update, reply)
+        if len(items) > MAX_INPUT_ITEMS:
+            await update.message.reply_text(f"Dữ liệu quá nhiều. Tối đa {MAX_INPUT_ITEMS} kết quả mỗi lần.")
+            return
+
+        inserted = save_outcomes(items, text)
+
+        resolved = resolve_pending_predictions(items)
+        latest_resolution = resolved[-1] if resolved else get_latest_resolution()
+
+        seq = load_history(200)
+        analysis = classify_pattern_pro(seq)
+
+        save_current_prediction_if_any(seq)
+
+        total_saved = count_saved_rounds()
+        wins, losses = get_prediction_stats()
+
+        reply = build_live_reply(
+            inserted_count=inserted,
+            total_saved=total_saved,
+            latest_resolution=latest_resolution,
+            wins=wins,
+            losses=losses,
+            analysis=analysis,
+        )
+
+        await update.message.reply_text(reply)
+
+    except Exception as e:
+        logger.exception("Error in process_live_input")
+        if update.message:
+            await update.message.reply_text(f"Bị lỗi khi xử lý: {e}")
 
 
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -956,6 +939,10 @@ async def import_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     items = extract_outcomes(text)
     if not items:
         await update.message.reply_text("Không tìm thấy dữ liệu hợp lệ.")
+        return
+
+    if len(items) > MAX_INPUT_ITEMS:
+        await update.message.reply_text(f"Dữ liệu quá nhiều. Tối đa {MAX_INPUT_ITEMS} kết quả mỗi lần.")
         return
 
     inserted = save_outcomes(items, text)
@@ -1068,13 +1055,12 @@ async def patterns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = Counter(seq)
     segs = rle(seq[-n:])
     seg_text = " ".join(f"{v}{k}" for v, k in segs[-12:])
-    base = "Tài" if count["T"] >= count["X"] else "Xỉu"
 
     if analysis["recognized"] and analysis["prediction"] in {"T", "X"} and len(seq) >= MIN_PREDICT_HISTORY:
         reply = (
             f"Nhận diện: {analysis['pattern_label']}\n"
             f"Chuỗi segment: {seg_text}\n"
-            f"Xu hướng nền: {base}\n"
+            f"Tài: {count['T']} | Xỉu: {count['X']}\n"
             f"Vào: {fmt_outcome(analysis['prediction'])} | Độ tin cậy: {analysis['confidence']}%\n"
             f"Tỷ lệ: Theo {analysis['follow_pct']}% | Bẻ {analysis['reverse_pct']}%"
         )
@@ -1084,14 +1070,14 @@ async def patterns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = (
             f"Nhận diện: {analysis['pattern_label']}\n"
             f"Chuỗi segment: {seg_text}\n"
-            f"Xu hướng nền: {base}\n"
+            f"Tài: {count['T']} | Xỉu: {count['X']}\n"
             f"Vào: Không dự đoán"
         )
     else:
         reply = (
             "Nhận diện: Không nhận diện được cầu\n"
             f"Chuỗi segment: {seg_text}\n"
-            f"Xu hướng nền: {base}\n"
+            f"Tài: {count['T']} | Xỉu: {count['X']}\n"
             f"Vào: Không dự đoán"
         )
 
@@ -1126,6 +1112,26 @@ async def brain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     await update.message.reply_text("\n".join(lines))
+
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return await deny_if_not_admin(update)
+    if not update.message:
+        return
+
+    n = 200
+    if context.args and context.args[0].isdigit():
+        n = max(20, min(2000, int(context.args[0])))
+
+    seq = load_history(n)
+    if not seq:
+        await update.message.reply_text("Chưa có dữ liệu.")
+        return
+
+    analysis = classify_pattern_pro(seq)
+    reply = build_report_reply(seq, analysis)
+    await update.message.reply_text(reply)
 
 
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1182,9 +1188,11 @@ def main():
     app.add_handler(CommandHandler("scan", scan_cmd))
     app.add_handler(CommandHandler("patterns", patterns_cmd))
     app.add_handler(CommandHandler("brain", brain_cmd))
+    app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CommandHandler("reset_history", reset_history_cmd))
     app.add_handler(CommandHandler("reset_all", reset_all_cmd))
+
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
 
     logger.info("Bot đang chạy...")
