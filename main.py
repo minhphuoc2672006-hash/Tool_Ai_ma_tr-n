@@ -623,6 +623,57 @@ def weighted_trend(seq: List[str], window: int = 20) -> Tuple[Optional[str], int
     return trend, abs(score)
 
 
+def adjust_prediction_by_memory(pattern_label: str, predicted_outcome: Optional[str], confidence: int) -> Tuple[Optional[str], int, bool, str]:
+    """Điều chỉnh dự đoán theo brain, luôn trả về đúng 4 giá trị."""
+    try:
+        if not pattern_label or predicted_outcome not in {"T", "X"}:
+            return predicted_outcome, confidence, False, "NO_MEMORY"
+
+        key = pattern_family(pattern_label)
+        mem = get_pattern_memory(key)
+        if not mem:
+            return predicted_outcome, confidence, False, "NO_MEMORY"
+
+        wins = int(mem["wins"])
+        losses = int(mem["losses"])
+        recent_losses = int(mem["recent_losses"])
+        total = wins + losses
+
+        if total <= 0:
+            return predicted_outcome, confidence, False, "NO_MEMORY"
+
+        win_rate = wins / total
+        flip = False
+        reason = "FOLLOW"
+
+        if total >= 5 and win_rate < 0.30:
+            flip = True
+            reason = "LOW_WINRATE"
+        elif recent_losses >= 3:
+            flip = True
+            reason = "RECENT_LOSS"
+
+        adjusted_conf = int(confidence)
+        if total >= 10:
+            if win_rate >= 0.60:
+                adjusted_conf += 5
+            elif win_rate <= 0.40:
+                adjusted_conf -= 8
+            else:
+                adjusted_conf -= 4
+
+        if flip and predicted_outcome in {"T", "X"}:
+            predicted_outcome = reverse_outcome(predicted_outcome)
+            adjusted_conf -= 5
+
+        adjusted_conf = clamp(adjusted_conf, 0, 100)
+        return predicted_outcome, adjusted_conf, flip, reason
+
+    except Exception as e:
+        logger.exception("Lỗi adjust_prediction_by_memory: %s", e)
+        return predicted_outcome, confidence, False, "ERROR"
+
+
 def detect_noise_score(seq: List[str], segments: List[Tuple[str, int]]) -> Tuple[int, str]:
     if len(seq) < 4:
         return 65, "Chuỗi quá ngắn"
@@ -1134,8 +1185,6 @@ WELCOME = (
     "/history [n]            - xem n kết quả gần nhất\n"
     "/stats [n]              - thống kê tần suất\n"
     "/scan [n]               - phân tích lịch sử\n"
-
-
     "/brain [n]              - xem bộ nhớ não\n"
     "/clear, /reset_history  - xóa lịch sử + kèo chờ, giữ não\n"
     "/reset_all              - xóa toàn bộ, gồm cả não\n\n"
@@ -1386,6 +1435,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_live_input(update, context, text)
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled exception while processing update: %s", context.error)
+
+
 def main():
     if not TOKEN:
         raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN trong biến môi trường.")
@@ -1409,6 +1462,7 @@ def main():
     app.add_handler(CommandHandler("reset_history", reset_history_cmd))
     app.add_handler(CommandHandler("reset_all", reset_all_cmd))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    app.add_error_handler(error_handler)
 
     logger.info("Bot đang chạy...")
     app.run_polling()
