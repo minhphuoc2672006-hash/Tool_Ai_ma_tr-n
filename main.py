@@ -588,18 +588,16 @@ def adjust_prediction_by_memory(pattern_label: str, predicted_outcome: Optional[
     win_rate = wins / total
     flip = False
     reason = "FOLLOW"
-if total >= 5 and win_rate < 0.30:
-    flip = True
-    reason = "LOW_WINRATE"
 
-elif recent_losses >= 2:
-    flip = True
-    reason = "DOUBLE_LOSS"
-
-elif recent_losses == 1 and win_rate < 0.5:
-    flip = True
-    reason = "EARLY_WEAK"
-    
+    if total >= 5 and win_rate < 0.30:
+        flip = True
+        reason = "LOW_WINRATE"
+    elif recent_losses >= 2:
+        flip = True
+        reason = "DOUBLE_LOSS"
+    elif recent_losses == 1 and win_rate < 0.5:
+        flip = True
+        reason = "EARLY_WEAK"
 
     adjusted_conf = confidence
     if total >= 10:
