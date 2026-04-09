@@ -2,18 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-Telegram bot Tài/Xỉu theo lịch sử, có 2 lớp:
+Telegram bot thống kê Tài/Xỉu theo lịch sử, có 2 lớp:
 - History: lịch sử nhập vào, có thể reset riêng
-- Brain: bộ nhớ pattern win/lose, giữ lại khi reset history
+- Brain: bộ nhớ pattern ổn định/nhiễu, giữ lại khi reset history
 
 Bản này:
-- Chỉ ưu tiên theo cầu (pattern)
+- Ưu tiên nhận diện pattern và biến thể pattern
 - Không dùng xu hướng nền / xu hướng gần
-- Bỏ delay, trả kết quả ngay
+- Trả kết quả ngay
 - Reset history không đụng brain
 - Reset all mới xóa brain
 - Có /report để thống kê nhận diện cầu và brain
 - Có fallback nhẹ để không bị "im" khi không bắt được cầu rõ
+- Không xuất kèo dự đoán
 """
 
 import os
@@ -28,7 +29,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 DB_PATH = os.getenv("TAI_XIU_DB_PATH", "tai_xiu_stats.db")
-MIN_PREDICT_HISTORY = 15
+MIN_HISTORY_FOR_FALLBACK = 15
 MAX_INPUT_ITEMS = 100
 
 _admin_raw = os.getenv("ADMIN_USER_ID", "").strip()
@@ -78,23 +79,6 @@ def init_db():
 
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS predictions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                based_on_count INTEGER NOT NULL,
-                pattern TEXT NOT NULL,
-                predicted_outcome TEXT NOT NULL CHECK(predicted_outcome IN ('T', 'X')),
-                confidence INTEGER NOT NULL,
-                resolved INTEGER NOT NULL DEFAULT 0,
-                actual_outcome TEXT,
-                correct INTEGER,
-                resolved_at TEXT
-            )
-            """
-        )
-
-        conn.execute(
-            """
             CREATE TABLE IF NOT EXISTS pattern_memory (
                 pattern_key TEXT PRIMARY KEY,
                 wins INTEGER NOT NULL DEFAULT 0,
@@ -122,14 +106,12 @@ def save_outcomes(outcomes: List[str], raw: str) -> int:
 def reset_history_only():
     with get_conn() as conn:
         conn.execute("DELETE FROM rounds")
-        conn.execute("DELETE FROM predictions")
         conn.commit()
 
 
 def reset_all():
     with get_conn() as conn:
         conn.execute("DELETE FROM rounds")
-        conn.execute("DELETE FROM predictions")
         conn.execute("DELETE FROM pattern_memory")
         conn.commit()
 
@@ -156,18 +138,6 @@ def count_saved_rounds() -> int:
     with get_conn() as conn:
         row = conn.execute("SELECT COUNT(*) AS c FROM rounds").fetchone()
     return int(row["c"]) if row else 0
-
-
-def save_prediction(pattern: str, predicted_outcome: str, confidence: int, based_on_count: int):
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO predictions(based_on_count, pattern, predicted_outcome, confidence)
-            VALUES(?, ?, ?, ?)
-            """,
-            (based_on_count, pattern, predicted_outcome, confidence),
-        )
-        conn.commit()
 
 
 def reverse_outcome(v: str) -> str:
@@ -200,6 +170,16 @@ def pattern_family(label: str) -> str:
         return "LUAN_PHIEN"
     if t.startswith("Cầu nhịp đều"):
         return "NHIP_DEU"
+    if t.startswith("Cầu dập"):
+        return "DAP"
+    if t.startswith("Cầu gãy giả"):
+        return "FAKE_BREAK"
+    if t.startswith("Cầu hồi"):
+        return "REBOUND"
+    if t.startswith("Cầu kéo dài yếu"):
+        return "WEAK_STREAK"
+    if t.startswith("Cầu zigzag"):
+        return "ZIGZAG"
     if t.startswith("Cầu hỗn hợp biến thể"):
         return "HON_HOP_BIEN_THE"
     if t.startswith("Cầu hỗn hợp"):
@@ -230,7 +210,7 @@ def get_pattern_memory(pattern_key: str) -> Optional[Dict[str, int]]:
     }
 
 
-def update_pattern_memory_in_conn(conn: sqlite3.Connection, pattern_key: str, correct: bool):
+def update_pattern_memory_in_conn(conn: sqlite3.Connection, pattern_key: str, strong: bool):
     row = conn.execute(
         """
         SELECT wins, losses, recent_losses
@@ -249,7 +229,7 @@ def update_pattern_memory_in_conn(conn: sqlite3.Connection, pattern_key: str, co
         losses = 0
         recent_losses = 0
 
-    if correct:
+    if strong:
         wins += 1
         recent_losses = 0
     else:
@@ -270,92 +250,6 @@ def update_pattern_memory_in_conn(conn: sqlite3.Connection, pattern_key: str, co
     )
 
 
-def resolve_pending_predictions(actual_outcomes: List[str]) -> List[Dict[str, Any]]:
-    if not actual_outcomes:
-        return []
-
-    resolved_rows: List[Dict[str, Any]] = []
-
-    with get_conn() as conn:
-        pending = conn.execute(
-            """
-            SELECT id, predicted_outcome, pattern, confidence
-            FROM predictions
-            WHERE resolved = 0
-            ORDER BY id ASC
-            """
-        ).fetchall()
-
-        for pred_row, actual in zip(pending, actual_outcomes):
-            correct = 1 if pred_row["predicted_outcome"] == actual else 0
-            conn.execute(
-                """
-                UPDATE predictions
-                SET resolved = 1,
-                    actual_outcome = ?,
-                    correct = ?,
-                    resolved_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (actual, correct, pred_row["id"]),
-            )
-            resolved_rows.append(
-                {
-                    "predicted_outcome": pred_row["predicted_outcome"],
-                    "actual_outcome": actual,
-                    "correct": bool(correct),
-                    "pattern": pred_row["pattern"],
-                    "confidence": int(pred_row["confidence"]),
-                }
-            )
-            update_pattern_memory_in_conn(conn, pattern_family(pred_row["pattern"]), bool(correct))
-
-        conn.commit()
-
-    return resolved_rows
-
-
-def get_prediction_stats() -> Tuple[int, int]:
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT
-                COUNT(*) AS total,
-                COALESCE(SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END), 0) AS wins
-            FROM predictions
-            WHERE resolved = 1
-            """
-        ).fetchone()
-    total = int(row["total"]) if row else 0
-    wins = int(row["wins"]) if row else 0
-    losses = max(0, total - wins)
-    return wins, losses
-
-
-def get_latest_resolution() -> Optional[Dict[str, Any]]:
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT predicted_outcome, actual_outcome, correct, pattern, confidence
-            FROM predictions
-            WHERE resolved = 1
-            ORDER BY id DESC
-            LIMIT 1
-            """
-        ).fetchone()
-
-    if not row:
-        return None
-
-    return {
-        "predicted_outcome": row["predicted_outcome"],
-        "actual_outcome": row["actual_outcome"],
-        "correct": bool(row["correct"]),
-        "pattern": row["pattern"],
-        "confidence": int(row["confidence"]),
-    }
-
-
 def get_brain_rows(limit: int = 10):
     with get_conn() as conn:
         rows = conn.execute(
@@ -374,6 +268,21 @@ def count_brain_patterns() -> int:
     with get_conn() as conn:
         row = conn.execute("SELECT COUNT(*) AS c FROM pattern_memory").fetchone()
     return int(row["c"]) if row else 0
+
+
+def get_brain_totals() -> Tuple[int, int]:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(wins), 0) AS strong_hits,
+                COALESCE(SUM(losses), 0) AS weak_hits
+            FROM pattern_memory
+            """
+        ).fetchone()
+    strong_hits = int(row["strong_hits"]) if row else 0
+    weak_hits = int(row["weak_hits"]) if row else 0
+    return strong_hits, weak_hits
 
 
 TOKEN_RE = re.compile(r"\b(?:TÀI|TAI|XỈU|XIU|T|X|\d+)\b", re.UNICODE)
@@ -457,11 +366,12 @@ def detect_soft_streak(seq: List[str]) -> Optional[int]:
 def detect_alternating_pro(seq: List[str]) -> Optional[int]:
     if len(seq) < 6:
         return None
-    tail = seq[-8:]
+    tail = seq[-10:]
     if len(tail) < 6:
         return None
     mismatches = sum(1 for i in range(len(tail) - 1) if tail[i] == tail[i + 1])
-    if mismatches <= 1:
+    noise_ratio = mismatches / max(1, len(tail) - 1)
+    if noise_ratio <= 0.20:
         length = len(tail)
         i = len(seq) - len(tail) - 1
         while i >= 0 and seq[i] != seq[i + 1]:
@@ -471,10 +381,15 @@ def detect_alternating_pro(seq: List[str]) -> Optional[int]:
     return None
 
 
-def detect_exact_periodic_pro(seq: List[str], min_period: int = 2, max_period: int = 6, min_repeats: int = 3):
+def detect_exact_periodic_pro(
+    seq: List[str],
+    min_period: int = 2,
+    max_period: int = 6,
+    min_repeats: int = 3,
+):
     n = len(seq)
     for period in range(min_period, max_period + 1):
-        for repeats in range(min_repeats, min(8, n // period) + 1):
+        for repeats in range(min_repeats, min(10, n // period) + 1):
             need = period * repeats
             if n < need:
                 continue
@@ -485,13 +400,19 @@ def detect_exact_periodic_pro(seq: List[str], min_period: int = 2, max_period: i
     return None, 0
 
 
-def detect_approx_periodic_pro(seq: List[str], min_period: int = 2, max_period: int = 6, min_repeats: int = 3, max_mismatches: int = 2):
+def detect_approx_periodic_pro(
+    seq: List[str],
+    min_period: int = 2,
+    max_period: int = 6,
+    min_repeats: int = 3,
+    max_mismatches: int = 2,
+):
     n = len(seq)
     best_motif = None
     best_repeats = 0
     best_score = -10**9
     for period in range(min_period, max_period + 1):
-        for repeats in range(min_repeats, min(8, n // period) + 1):
+        for repeats in range(min_repeats, min(10, n // period) + 1):
             need = period * repeats
             if n < need:
                 continue
@@ -530,15 +451,17 @@ def detect_length_signature_pro(segments: List[Tuple[str, int]]) -> Optional[str
 
 
 def detect_mixed_pattern_pro(seq: List[str], segments: List[Tuple[str, int]]) -> Optional[str]:
-    if len(seq) < 8 or len(segments) < 4:
+    if len(seq) < 10 or len(segments) < 5:
         return None
-    tail_lengths = [s[1] for s in segments[-6:]]
-    if len(tail_lengths) < 4:
+    tail_lengths = [s[1] for s in segments[-8:]]
+    if len(tail_lengths) < 5:
         return None
     unique_count = len(set(tail_lengths))
     variance = max(tail_lengths) - min(tail_lengths)
-    if 2 <= unique_count <= 4 and variance >= 2:
+    if unique_count >= 3 and variance >= 2:
         return f"Cầu hỗn hợp biến thể {'-'.join(map(str, tail_lengths))}"
+    if unique_count >= 2:
+        return f"Cầu hỗn hợp {'-'.join(map(str, tail_lengths))}"
     return None
 
 
@@ -569,64 +492,64 @@ def detect_transition_pro(segments: List[Tuple[str, int]]) -> Optional[str]:
     return None
 
 
-def adjust_prediction_by_memory(pattern_label: str, predicted_outcome: Optional[str], confidence: int) -> Tuple[Optional[str], int, bool, str]:
-    if not pattern_label or predicted_outcome not in {"T", "X"}:
-        return predicted_outcome, confidence, False, "NO_MEMORY"
+def detect_wave_pattern(seq: List[str]) -> Optional[str]:
+    if len(seq) < 8:
+        return None
+    segs = rle(seq)
+    lens = [s[1] for s in segs[-6:]]
+    if lens in ([2, 1, 2, 1, 2, 1], [1, 2, 1, 2, 1, 2]):
+        return f"Cầu dập {'-'.join(map(str, lens))}"
+    return None
 
-    key = pattern_family(pattern_label)
-    mem = get_pattern_memory(key)
-    if not mem:
-        return predicted_outcome, confidence, False, "NO_MEMORY"
 
-    wins = mem["wins"]
-    losses = mem["losses"]
-    recent_losses = mem["recent_losses"]
-    total = wins + losses
-    if total <= 0:
-        return predicted_outcome, confidence, False, "NO_MEMORY"
+def detect_fake_break(seq: List[str]) -> Optional[str]:
+    if len(seq) < 6:
+        return None
+    segs = rle(seq)
+    if len(segs) >= 3:
+        a, b, c = segs[-3:]
+        if a[1] >= 4 and b[1] == 1 and c[1] >= 2:
+            return f"Cầu gãy giả {a[0]} x{a[1]}"
+    return None
 
-    win_rate = wins / total
-    flip = False
-    reason = "FOLLOW"
 
-    if total >= 5 and win_rate < 0.45:
-        flip = True
-        reason = "LOW_WINRATE"
-    elif recent_losses >= 1:
-        flip = True
-        reason = "DOUBLE_LOSS"
-    elif recent_losses == 1 and win_rate < 0.5:
-        flip = True
-        reason = "EARLY_WEAK"
+def detect_rebound(seq: List[str]) -> Optional[str]:
+    if len(seq) < 6:
+        return None
+    if seq[-1] == seq[-3] and seq[-2] != seq[-1]:
+        return "Cầu hồi"
+    return None
 
-    adjusted_conf = confidence
-    if total >= 10:
-        if win_rate >= 0.60:
-            adjusted_conf += 5
-        elif win_rate <= 0.40:
-            adjusted_conf -= 8
-        else:
-            adjusted_conf -= 4
 
-    if flip:
-        predicted_outcome = reverse_outcome(predicted_outcome)
-        adjusted_conf -= 5
+def detect_weak_streak(seq: List[str]) -> Optional[str]:
+    if len(seq) < 6:
+        return None
+    segs = rle(seq)
+    if len(segs) >= 3:
+        tail = [s[1] for s in segs[-4:]]
+        if len(set(tail)) <= 2 and max(tail) - min(tail) <= 1:
+            return f"Cầu kéo dài yếu {'-'.join(map(str, tail))}"
+    return None
 
-    adjusted_conf = max(0, min(100, adjusted_conf))
-    return predicted_outcome, adjusted_conf, flip, reason
+
+def detect_zigzag(seq: List[str]) -> Optional[str]:
+    if len(seq) < 7:
+        return None
+    tail = seq[-7:]
+    changes = sum(1 for i in range(1, len(tail)) if tail[i] != tail[i - 1])
+    if changes >= 4:
+        return "Cầu zigzag"
+    return None
 
 
 def classify_pattern_pro(seq: List[str]) -> Dict[str, Any]:
     result = {
         "pattern_label": "Không nhận diện được cầu",
-        "prediction": None,
         "confidence": 0,
         "recognized": False,
-        "flipped": False,
-        "flip_reason": "",
-        "follow_pct": 0,
-        "reverse_pct": 0,
         "source": "",
+        "detail": "",
+        "family": "OTHER",
     }
 
     if len(seq) < 5:
@@ -636,55 +559,102 @@ def classify_pattern_pro(seq: List[str]) -> Dict[str, Any]:
     segments = rle(window)
     last_val, streak_len = current_streak(window)
 
-    def finalize(label: str, pred: Optional[str], conf: int, source: str):
-        pred2, conf2, flipped, reason = adjust_prediction_by_memory(label, pred, conf)
-        follow_pct = conf2
-        reverse_pct = max(0, min(100, 100 - conf2))
-        return {
-            "pattern_label": label,
-            "prediction": pred2,
-            "confidence": conf2,
-            "recognized": True,
-            "flipped": flipped,
-            "flip_reason": reason if flipped else "",
-            "follow_pct": follow_pct,
-            "reverse_pct": reverse_pct,
-            "source": source,
-        }
+    changes = sum(1 for i in range(1, len(window)) if window[i] != window[i - 1])
+    noise_ratio = changes / max(1, len(window) - 1)
+
+    candidates: List[Dict[str, Any]] = []
+
+    def add_candidate(label: str, conf: int, source: str, detail: str):
+        adjusted_conf = conf
+        if noise_ratio > 0.60:
+            adjusted_conf -= 25
+        elif noise_ratio > 0.45:
+            adjusted_conf -= 15
+        elif noise_ratio > 0.30:
+            adjusted_conf -= 8
+
+        if len(window) < 8:
+            adjusted_conf -= 8
+
+        adjusted_conf = max(0, min(100, adjusted_conf))
+        if adjusted_conf < 45:
+            return
+
+        candidates.append(
+            {
+                "pattern_label": label,
+                "confidence": adjusted_conf,
+                "recognized": True,
+                "source": source,
+                "detail": detail,
+                "family": pattern_family(label),
+            }
+        )
 
     soft_streak = detect_soft_streak(window)
     if soft_streak and soft_streak >= 3:
-        return finalize(f"Cầu bệt vừa {last_val} x{soft_streak}", last_val, 80, "SOFT_STREAK")
+        add_candidate(
+            f"Cầu bệt vừa {last_val} x{soft_streak}",
+            78 + min(4, soft_streak),
+            "SOFT_STREAK",
+            f"soft_streak={soft_streak}",
+        )
 
     if streak_len >= 5:
-        return finalize(f"Cầu bệt {last_val} x{streak_len}", last_val, 90, "STREAK")
+        add_candidate(
+            f"Cầu bệt {last_val} x{streak_len}",
+            min(95, 80 + streak_len),
+            "STREAK",
+            f"streak_len={streak_len}",
+        )
 
     alt_len = detect_alternating_pro(window)
     if alt_len and alt_len >= 6:
-        pred = "T" if last_val == "X" else "X"
-        return finalize(f"Cầu đảo 1-1 x{alt_len}", pred, 86, "ALTERNATING")
+        add_candidate(
+            f"Cầu đảo 1-1 x{alt_len}",
+            max(72, 92 - int(noise_ratio * 100)),
+            "ALTERNATING",
+            f"noise_ratio={noise_ratio:.2f}",
+        )
 
     motif, rep = detect_exact_periodic_pro(window, min_period=2, max_period=6, min_repeats=3)
     if motif:
         motif_text = "-".join(motif)
         if len(motif) == 2 and motif[0] != motif[1]:
-            pred = "T" if last_val == "X" else "X"
-            return finalize(f"Cầu chu kỳ đảo {motif_text} x{rep}", pred, 84, "PERIODIC_FLIP")
-        pred = motif[0]
-        return finalize(f"Cầu chu kỳ {motif_text} x{rep}", pred, 82, "PERIODIC")
+            add_candidate(
+                f"Cầu chu kỳ đảo {motif_text} x{rep}",
+                84,
+                "PERIODIC_FLIP",
+                "exact_periodic_flip",
+            )
+        else:
+            add_candidate(
+                f"Cầu chu kỳ {motif_text} x{rep}",
+                82,
+                "PERIODIC",
+                "exact_periodic",
+            )
 
     approx_motif, approx_rep = detect_approx_periodic_pro(window, min_period=2, max_period=6, min_repeats=3, max_mismatches=2)
     if approx_motif:
         motif_text = "-".join(approx_motif)
         if len(approx_motif) == 2 and approx_motif[0] != approx_motif[1]:
-            pred = "T" if last_val == "X" else "X"
-            return finalize(f"Cầu gần chu kỳ đảo {motif_text} x{approx_rep}", pred, 78, "NEAR_PERIODIC_FLIP")
-        pred = approx_motif[0]
-        return finalize(f"Cầu gần chu kỳ {motif_text} x{approx_rep}", pred, 76, "NEAR_PERIODIC")
+            add_candidate(
+                f"Cầu gần chu kỳ đảo {motif_text} x{approx_rep}",
+                78,
+                "NEAR_PERIODIC_FLIP",
+                "approx_periodic_flip",
+            )
+        else:
+            add_candidate(
+                f"Cầu gần chu kỳ {motif_text} x{approx_rep}",
+                76,
+                "NEAR_PERIODIC",
+                "approx_periodic",
+            )
 
     length_sig = detect_length_signature_pro(segments)
     if length_sig:
-        pred = last_val if last_val in {"T", "X"} else None
         if "đối xứng" in length_sig:
             conf = 80
         elif "luân phiên" in length_sig:
@@ -699,79 +669,105 @@ def classify_pattern_pro(seq: List[str]) -> Dict[str, Any]:
             conf = 66
         else:
             conf = 60
-        return finalize(length_sig, pred, conf, "LENGTH_SIGNATURE")
+        add_candidate(length_sig, conf, "LENGTH_SIGNATURE", "length_signature")
+
+    wave = detect_wave_pattern(window)
+    if wave:
+        add_candidate(wave, 75, "WAVE", "wave_pattern")
+
+    fake_break = detect_fake_break(window)
+    if fake_break:
+        add_candidate(fake_break, 70, "FAKE_BREAK", "fake_break")
+
+    rebound = detect_rebound(window)
+    if rebound:
+        add_candidate(rebound, 72, "REBOUND", "rebound")
+
+    weak = detect_weak_streak(window)
+    if weak:
+        add_candidate(weak, 58, "WEAK_STREAK", "weak_streak")
+
+    zigzag = detect_zigzag(window)
+    if zigzag:
+        add_candidate(zigzag, 61, "ZIGZAG", "zigzag")
 
     mixed = detect_mixed_pattern_pro(window, segments)
     if mixed:
-        pred = last_val if last_val in {"T", "X"} else None
-        return finalize(mixed, pred, 63, "MIXED")
+        add_candidate(mixed, 63, "MIXED", "mixed_pattern")
 
     break_type = detect_break_pro(window, segments)
     if break_type:
-        pred = last_val if last_val in {"T", "X"} else None
-        return finalize(break_type, pred, 73, "BREAK")
+        add_candidate(break_type, 73, "BREAK", "break_pattern")
 
     transition = detect_transition_pro(segments)
     if transition:
-        pred = last_val if last_val in {"T", "X"} else None
-        return finalize(transition, pred, 70, "TRANSITION")
+        add_candidate(transition, 70, "TRANSITION", "transition_pattern")
 
-    if len(seq) >= MIN_PREDICT_HISTORY and last_val in {"T", "X"}:
+    if candidates:
+        best = max(candidates, key=lambda x: x["confidence"])
+        best["prediction"] = None
+        best["flipped"] = False
+        best["flip_reason"] = ""
+        best["follow_pct"] = best["confidence"]
+        best["reverse_pct"] = max(0, 100 - best["confidence"])
+        return {**result, **best}
+
+    if len(seq) >= MIN_HISTORY_FOR_FALLBACK:
+        fallback_conf = max(45, 55 - int(noise_ratio * 20))
         return {
-            "pattern_label": "Fallback đảo nhẹ",
-            "prediction": reverse_outcome(last_val),
-            "confidence": 55,
+            "pattern_label": "Fallback nhẹ / nhiễu",
+            "confidence": fallback_conf,
             "recognized": True,
+            "prediction": None,
+            "source": "FALLBACK",
+            "detail": f"noise_ratio={noise_ratio:.2f}",
+            "family": "OTHER",
             "flipped": False,
             "flip_reason": "",
-            "follow_pct": 55,
-            "reverse_pct": 45,
-            "source": "FALLBACK",
+            "follow_pct": fallback_conf,
+            "reverse_pct": min(55, 100 - fallback_conf),
         }
 
     return result
 
 
+def update_brain_from_analysis(analysis: Dict[str, Any]):
+    if not analysis.get("recognized"):
+        return
+    label = analysis.get("pattern_label", "")
+    if not label:
+        return
+    strong = int(analysis.get("confidence", 0)) >= 75
+    key = pattern_family(label)
+    with get_conn() as conn:
+        update_pattern_memory_in_conn(conn, key, strong)
+        conn.commit()
+
+
+def format_pattern_summary(analysis: Dict[str, Any]) -> str:
+    if not analysis["recognized"]:
+        return "Cầu: Không nhận diện được cầu"
+    return (
+        f"Cầu: {analysis['pattern_label']}\n"
+        f"Nhóm: {analysis['family']}\n"
+        f"Nguồn: {analysis['source']}\n"
+        f"Chi tiết: {analysis['detail']}\n"
+        f"Độ khớp: {analysis['confidence']}%\n"
+        f"Tỷ lệ khớp: {analysis['follow_pct']}% | Nhiễu: {analysis['reverse_pct']}%"
+    )
+
+
 def build_live_reply(
     inserted_count: int,
     total_saved: int,
-    latest_resolution: Optional[Dict[str, Any]],
-    wins: int,
-    losses: int,
     analysis: Dict[str, Any],
+    brain_strong: int,
+    brain_weak: int,
 ) -> str:
-    if latest_resolution:
-        pred = fmt_outcome(latest_resolution["predicted_outcome"])
-        actual = fmt_outcome(latest_resolution["actual_outcome"])
-        result_text = "ĐÚNG" if latest_resolution["correct"] else "SAI"
-        section2 = f"Kèo trước: {pred} → {actual} | {result_text}"
-    else:
-        section2 = "Kèo trước: Chưa có kèo trước để chốt"
-
-    section3 = f"Thắng/Thua: Thắng {wins} | Thua {losses}"
-
-    if analysis["recognized"]:
-        section4 = f"Cầu: {analysis['pattern_label']}"
-    else:
-        section4 = "Cầu: Không nhận diện được cầu"
-
-    if analysis["recognized"] and analysis["prediction"] in {"T", "X"}:
-        final_txt = fmt_outcome(analysis["prediction"])
-        section5 = (
-            f"Dự đoán mới: {final_txt} | Độ tin cậy: {analysis['confidence']}%\n"
-            f"Tỷ lệ: Theo {analysis['follow_pct']}% | Bẻ {analysis['reverse_pct']}%"
-        )
-        if analysis["flipped"]:
-            section5 += f"\nĐã bẻ: {analysis['flip_reason']}"
-    else:
-        section5 = "Dự đoán mới: Không dự đoán"
-
     return (
         f"Đã lưu kết quả: +{inserted_count} | Tổng đã lưu: {total_saved}\n"
-        f"{section2}\n"
-        f"{section3}\n"
-        f"{section4}\n"
-        f"{section5}"
+        f"Brain: Ổn định {brain_strong} | Nhiễu {brain_weak}\n"
+        f"{format_pattern_summary(analysis)}"
     )
 
 
@@ -780,21 +776,10 @@ def build_import_reply(
     total_saved: int,
     analysis: Dict[str, Any],
 ) -> str:
-    section2 = f"Đã lưu kết quả: +{inserted_count} | Tổng đã lưu: {total_saved}"
-    section3 = f"Cầu: {analysis['pattern_label']}" if analysis["recognized"] else "Cầu: Không nhận diện được cầu"
-
-    if analysis["recognized"] and analysis["prediction"] in {"T", "X"}:
-        final_txt = fmt_outcome(analysis["prediction"])
-        section4 = (
-            f"Dự đoán mới: {final_txt} | Độ tin cậy: {analysis['confidence']}%\n"
-            f"Tỷ lệ: Theo {analysis['follow_pct']}% | Bẻ {analysis['reverse_pct']}%"
-        )
-        if analysis["flipped"]:
-            section4 += f"\nĐã bẻ: {analysis['flip_reason']}"
-    else:
-        section4 = "Dự đoán mới: Không dự đoán"
-
-    return f"{section2}\n{section3}\n{section4}"
+    return (
+        f"Đã lưu kết quả: +{inserted_count} | Tổng đã lưu: {total_saved}\n"
+        f"{format_pattern_summary(analysis)}"
+    )
 
 
 def build_report_reply(seq: List[str], analysis: Dict[str, Any]) -> str:
@@ -806,44 +791,23 @@ def build_report_reply(seq: List[str], analysis: Dict[str, Any]) -> str:
     if brain_rows:
         for r in brain_rows:
             total_p = int(r["wins"]) + int(r["losses"])
-            win_rate = (int(r["wins"]) / total_p * 100) if total_p else 0.0
+            stable_rate = (int(r["wins"]) / total_p * 100) if total_p else 0.0
             brain_lines.append(
-                f"- {r['pattern_key']} | W:{r['wins']} L:{r['losses']} | LR:{r['recent_losses']} | {win_rate:.1f}%"
+                f"- {r['pattern_key']} | Ổn định:{r['wins']} Nhiễu:{r['losses']} | "
+                f"LR:{r['recent_losses']} | {stable_rate:.1f}%"
             )
     else:
-        brain_lines.append("- Chưa có dữ liệu não.")
-
-    if analysis["recognized"] and analysis["prediction"] in {"T", "X"}:
-        predict_text = f"{fmt_outcome(analysis['prediction'])} ({analysis['confidence']}%)"
-    elif analysis["recognized"]:
-        predict_text = "Không dự đoán"
-    else:
-        predict_text = "Không nhận diện được cầu"
+        brain_lines.append("- Chưa có dữ liệu brain.")
 
     return (
         f"Thống kê tổng: {total} mẫu\n"
         f"- Tài: {count['T']}\n"
         f"- Xỉu: {count['X']}\n"
         f"\nCầu hiện tại:\n"
-        f"- {analysis['pattern_label']}\n"
-        f"- Dự đoán: {predict_text}\n"
+        f"{format_pattern_summary(analysis)}\n"
         f"\nNão (top pattern):\n"
         + "\n".join(brain_lines)
     )
-
-
-def save_current_prediction_if_any(seq: List[str]) -> None:
-    if len(seq) < MIN_PREDICT_HISTORY:
-        return
-
-    analysis = classify_pattern_pro(seq)
-    if analysis["recognized"] and analysis["prediction"] in {"T", "X"}:
-        save_prediction(
-            pattern=analysis["pattern_label"],
-            predicted_outcome=analysis["prediction"],
-            confidence=analysis["confidence"],
-            based_on_count=len(seq),
-        )
 
 
 WELCOME = (
@@ -857,7 +821,7 @@ WELCOME = (
     "/patterns [n]           - xem nhận diện cầu\n"
     "/brain [n]              - xem bộ nhớ não\n"
     "/report [n]             - thống kê nhận diện cầu\n"
-    "/clear, /reset_history  - xóa lịch sử + kèo chờ, giữ não\n"
+    "/clear, /reset_history  - xóa lịch sử\n"
     "/reset_all              - xóa toàn bộ, gồm cả não\n\n"
     "Chỉ ADMIN mới dùng được."
 )
@@ -885,27 +849,19 @@ async def process_live_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
             return
 
         inserted = save_outcomes(items, text)
-
-        resolved = resolve_pending_predictions(items)
-        latest_resolution = resolved[-1] if resolved else get_latest_resolution()
-
         seq = load_history(200)
         analysis = classify_pattern_pro(seq)
-
-        save_current_prediction_if_any(seq)
-
+        update_brain_from_analysis(analysis)
         total_saved = count_saved_rounds()
-        wins, losses = get_prediction_stats()
+        brain_strong, brain_weak = get_brain_totals()
 
         reply = build_live_reply(
             inserted_count=inserted,
             total_saved=total_saved,
-            latest_resolution=latest_resolution,
-            wins=wins,
-            losses=losses,
             analysis=analysis,
+            brain_strong=brain_strong,
+            brain_weak=brain_weak,
         )
-
         await update.message.reply_text(reply)
 
     except Exception as e:
@@ -948,6 +904,7 @@ async def import_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     inserted = save_outcomes(items, text)
     seq = load_history(200)
     analysis = classify_pattern_pro(seq)
+    update_brain_from_analysis(analysis)
     total_saved = count_saved_rounds()
 
     reply = build_import_reply(
@@ -1020,19 +977,7 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     analysis = classify_pattern_pro(seq)
-    if analysis["recognized"] and analysis["prediction"] in {"T", "X"} and len(seq) >= MIN_PREDICT_HISTORY:
-        msg = (
-            f"Cầu: {analysis['pattern_label']}\n"
-            f"Vào: {fmt_outcome(analysis['prediction'])} | Độ tin cậy: {analysis['confidence']}%\n"
-            f"Tỷ lệ: Theo {analysis['follow_pct']}% | Bẻ {analysis['reverse_pct']}%"
-        )
-        if analysis["flipped"]:
-            msg += f"\nĐã bẻ: {analysis['flip_reason']}"
-    elif analysis["recognized"]:
-        msg = f"Cầu: {analysis['pattern_label']}\nVào: Không dự đoán"
-    else:
-        msg = "Cầu: Không nhận diện được cầu\nVào: Không dự đoán"
-
+    msg = format_pattern_summary(analysis)
     await update.message.reply_text(msg)
 
 
@@ -1056,31 +1001,11 @@ async def patterns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     segs = rle(seq[-n:])
     seg_text = " ".join(f"{v}{k}" for v, k in segs[-12:])
 
-    if analysis["recognized"] and analysis["prediction"] in {"T", "X"} and len(seq) >= MIN_PREDICT_HISTORY:
-        reply = (
-            f"Nhận diện: {analysis['pattern_label']}\n"
-            f"Chuỗi segment: {seg_text}\n"
-            f"Tài: {count['T']} | Xỉu: {count['X']}\n"
-            f"Vào: {fmt_outcome(analysis['prediction'])} | Độ tin cậy: {analysis['confidence']}%\n"
-            f"Tỷ lệ: Theo {analysis['follow_pct']}% | Bẻ {analysis['reverse_pct']}%"
-        )
-        if analysis["flipped"]:
-            reply += f"\nĐã bẻ: {analysis['flip_reason']}"
-    elif analysis["recognized"]:
-        reply = (
-            f"Nhận diện: {analysis['pattern_label']}\n"
-            f"Chuỗi segment: {seg_text}\n"
-            f"Tài: {count['T']} | Xỉu: {count['X']}\n"
-            f"Vào: Không dự đoán"
-        )
-    else:
-        reply = (
-            "Nhận diện: Không nhận diện được cầu\n"
-            f"Chuỗi segment: {seg_text}\n"
-            f"Tài: {count['T']} | Xỉu: {count['X']}\n"
-            f"Vào: Không dự đoán"
-        )
-
+    reply = (
+        f"{format_pattern_summary(analysis)}\n"
+        f"Chuỗi segment: {seg_text}\n"
+        f"Tài: {count['T']} | Xỉu: {count['X']}"
+    )
     await update.message.reply_text(reply)
 
 
@@ -1099,16 +1024,19 @@ async def brain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Não chưa có dữ liệu.")
         return
 
+    strong_total, weak_total = get_brain_totals()
+
     lines = [
         f"Bộ nhớ não: {count_brain_patterns()} pattern",
+        f"Tổng ổn định: {strong_total} | Tổng nhiễu: {weak_total}",
         "Top pattern:",
     ]
     for r in rows:
         total = int(r["wins"]) + int(r["losses"])
-        win_rate = (int(r["wins"]) / total * 100) if total else 0.0
+        stable_rate = (int(r["wins"]) / total * 100) if total else 0.0
         lines.append(
-            f"- {r['pattern_key']} | W:{r['wins']} L:{r['losses']} "
-            f"| LoseStreak:{r['recent_losses']} | Winrate:{win_rate:.1f}%"
+            f"- {r['pattern_key']} | Ổn định:{r['wins']} Nhiễu:{r['losses']} "
+            f"| LoseStreak:{r['recent_losses']} | Rate:{stable_rate:.1f}%"
         )
 
     await update.message.reply_text("\n".join(lines))
@@ -1140,7 +1068,7 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     reset_history_only()
-    await update.message.reply_text("Đã xóa toàn bộ lịch sử và kèo chờ. Não vẫn được giữ lại.")
+    await update.message.reply_text("Đã xóa toàn bộ lịch sử.")
 
 
 async def reset_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1149,7 +1077,7 @@ async def reset_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     reset_history_only()
-    await update.message.reply_text("Đã reset lịch sử. Não vẫn được giữ lại.")
+    await update.message.reply_text("Đã reset lịch sử.")
 
 
 async def reset_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1158,7 +1086,7 @@ async def reset_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     reset_all()
-    await update.message.reply_text("Đã xóa toàn bộ: lịch sử, kèo chờ và não.")
+    await update.message.reply_text("Đã xóa toàn bộ: lịch sử và não.")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
