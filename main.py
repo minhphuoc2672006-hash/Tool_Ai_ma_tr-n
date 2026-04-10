@@ -23,9 +23,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or 0)
 
 if not BOT_TOKEN:
-    raise RuntimeError("Thiếu BOT_TOKEN trong .env")
+    raise RuntimeError("Thiếu BOT_TOKEN trong file .env")
 if not ADMIN_ID:
-    raise RuntimeError("Thiếu ADMIN_ID trong .env")
+    raise RuntimeError("Thiếu ADMIN_ID trong file .env")
 
 HEX_RE = re.compile(r"^[0-9a-fA-F]{8,64}$")
 
@@ -46,8 +46,8 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     score, result = predict(text)
 
-    # Chỉ trả về kết quả dự đoán
-    await update.message.reply_text(f"{result}")
+    # Chỉ trả lại kết quả phân tích, không lưu gì cả
+    await update.message.reply_text(f"{result} ({score})")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
