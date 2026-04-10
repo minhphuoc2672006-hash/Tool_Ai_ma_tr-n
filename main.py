@@ -44,6 +44,48 @@ logging.basicConfig(
 logger = logging.getLogger("tai_xiu_bot")
 DB_IO_LOCK = asyncio.Lock()
 
+# =========================
+# MATRIX UPGRADE
+# =========================
+MATRIX_SOURCE_BONUS = {
+    "STREAK": 1.18,
+    "SOFT_STREAK": 1.08,
+    "ZIGZAG": 1.16,
+    "PERIODIC": 1.12,
+    "PERIODIC_FLIP": 1.14,
+    "NEAR_PERIODIC": 1.04,
+    "NEAR_PERIODIC_FLIP": 1.06,
+    "BREAK": 1.14,
+    "TRANSITION": 1.05,
+    "LENGTH_SIGNATURE": 0.98,
+    "MIXED": 0.92,
+    "WEIGHTED_TREND": 0.88,
+    "MICRO_PRESSURE": 0.90,
+}
+
+MATRIX_FAMILY_BONUS = {
+    "ZIGZAG": 1.12,
+    "BET_SOFT": 1.07,
+    "BET": 1.10,
+    "DAO_1_1": 1.13,
+    "CHU_KY_DAO": 1.12,
+    "CHU_KY": 1.10,
+    "GAN_CHU_KY_DAO": 1.05,
+    "GAN_CHU_KY": 1.03,
+    "TANG_TIEN": 1.02,
+    "GIAM_TIEN": 1.02,
+    "DOI_XUNG": 1.10,
+    "LUAN_PHIEN": 1.08,
+    "NHIP_DEU": 1.04,
+    "HON_HOP_BIEN_THE": 0.96,
+    "HON_HOP": 0.95,
+    "BE_CAU": 1.18,
+    "CHUYEN_CAU": 1.04,
+    "XU_HUONG_GAN": 0.98,
+    "XU_HUONG_NEN": 0.94,
+    "MATRIX": 1.00,
+    "OTHER": 0.90,
+}
 
 # =========================
 # ADMIN CHECK
@@ -759,14 +801,71 @@ def build_zigzag_table(seq: List[str], limit_segments: int = 10) -> str:
     return "\n".join(lines)
 
 
+def matrix_source_bonus(source: str) -> float:
+    return MATRIX_SOURCE_BONUS.get(source, 1.0)
+
+
+def matrix_family_bonus(family: str) -> float:
+    return MATRIX_FAMILY_BONUS.get(family, 1.0)
+
+
+def matrix_effective_weight(signal: Dict[str, Any]) -> int:
+    conf = clamp(int(signal.get("confidence", 0)), 0, 100)
+    weight = max(1, int(signal.get("weight", 1)))
+    source = str(signal.get("source", ""))
+    family = str(signal.get("family", ""))
+
+    base = weight * (0.78 + conf / 260.0)
+    base *= matrix_source_bonus(source)
+    base *= matrix_family_bonus(family)
+
+    if signal.get("flipped"):
+        base *= 0.97
+
+    return max(1, int(round(base)))
+
+
+def detect_micro_pressure(seq: List[str]) -> Optional[Tuple[str, int, str]]:
+    if len(seq) < 8:
+        return None
+
+    tail = seq[-12:]
+    if len(tail) < 8:
+        return None
+
+    t = tail.count("T")
+    x = tail.count("X")
+    gap = abs(t - x)
+
+    if gap < 4:
+        return None
+
+    pred = "T" if t > x else "X"
+    strength = gap * 2 + (3 if tail[-3:] == [pred] * 3 else 0)
+    label = f"Ma trận vi mô {fmt_outcome(pred)}"
+    return pred, strength, label
+
+
 def build_matrix_preview(signals: List[Dict[str, Any]], limit: int = 6) -> str:
     if not signals:
         return "Ma trận: Không có tín hiệu đủ mạnh"
+
+    ordered = sorted(
+        signals,
+        key=lambda s: (
+            int(s.get("effective_weight", s.get("weight", 0))),
+            int(s.get("confidence", 0)),
+        ),
+        reverse=True,
+    )
+
     lines = ["Ma trận tín hiệu:"]
-    for s in signals[:limit]:
+    for s in ordered[:limit]:
         pred = fmt_outcome(s["predicted_outcome"]) if s["predicted_outcome"] in {"T", "X"} else "-"
+        ew = int(s.get("effective_weight", s.get("weight", 0)))
         lines.append(
-            f"- {s['pattern_label']} -> {pred} | {s['confidence']}% | w={s['weight']}"
+            f"- {s['pattern_label']} [{s['family']}] ({s['source']}) -> {pred} | "
+            f"{s['confidence']}% | w={s['weight']} | ew={ew}"
         )
     return "\n".join(lines)
 
@@ -806,25 +905,53 @@ def matrix_vote(signals: List[Dict[str, Any]]) -> Tuple[Optional[str], int, int,
         return None, 0, 0, 0, 0
 
     grouped: Dict[str, Dict[str, Any]] = {}
+
     for s in signals:
-        family = s["family"]
+        family = s.get("family", "OTHER")
+        enriched = dict(s)
+        enriched["effective_weight"] = matrix_effective_weight(enriched)
+
         current = grouped.get(family)
-        if current is None or (s["weight"] > current["weight"]) or (
-            s["weight"] == current["weight"] and s["confidence"] > current["confidence"]
+        if current is None:
+            grouped[family] = enriched
+            continue
+
+        if (
+            enriched["effective_weight"] > current["effective_weight"]
+            or (
+                enriched["effective_weight"] == current["effective_weight"]
+                and int(enriched.get("confidence", 0)) > int(current.get("confidence", 0))
+            )
         ):
-            grouped[family] = s
+            grouped[family] = enriched
 
     chosen = list(grouped.values())
-    score_t = sum(int(s["weight"]) for s in chosen if s["predicted_outcome"] == "T")
-    score_x = sum(int(s["weight"]) for s in chosen if s["predicted_outcome"] == "X")
+    if not chosen:
+        return None, 0, 0, 0, 0
+
+    score_t = sum(int(s["effective_weight"]) for s in chosen if s["predicted_outcome"] == "T")
+    score_x = sum(int(s["effective_weight"]) for s in chosen if s["predicted_outcome"] == "X")
     total = score_t + score_x
+
     if total <= 0:
         return None, 0, score_t, score_x, total
 
     pred = "T" if score_t >= score_x else "X"
     share = max(score_t, score_x) / total
     margin = abs(score_t - score_x) / total
-    confidence = clamp(int(round(50 + share * 25 + margin * 35)), 0, 100)
+    family_cnt = len(chosen)
+
+    confidence = clamp(
+        int(round(38 + share * 28 + margin * 32 + min(family_cnt, 6) * 2)),
+        0,
+        100,
+    )
+
+    if family_cnt >= 5:
+        confidence = clamp(confidence + 3, 0, 100)
+    if total < 120:
+        confidence = clamp(confidence - 5, 0, 100)
+
     return pred, confidence, score_t, score_x, total
 
 
@@ -851,6 +978,9 @@ def build_signal_bundle(seq: List[str]) -> Dict[str, Any]:
         "matrix_score_t": 0,
         "matrix_score_x": 0,
         "matrix_total": 0,
+        "matrix_signal_count": 0,
+        "matrix_family_count": 0,
+        "matrix_consensus": 0,
     }
 
     if len(seq) < 5:
@@ -865,19 +995,37 @@ def build_signal_bundle(seq: List[str]) -> Dict[str, Any]:
 
     soft_streak = detect_soft_streak(window)
     if soft_streak and soft_streak >= 3:
-        sig = make_signal(f"Cầu bệt vừa {last_val} x{soft_streak}", last_val, 80, "SOFT_STREAK", soft_streak)
+        sig = make_signal(
+            f"Cầu bệt vừa {last_val} x{soft_streak}",
+            last_val,
+            80,
+            "SOFT_STREAK",
+            soft_streak,
+        )
         if sig:
             signals.append(sig)
 
     if streak_len >= 5:
-        sig = make_signal(f"Cầu bệt {last_val} x{streak_len}", last_val, 90, "STREAK", streak_len)
+        sig = make_signal(
+            f"Cầu bệt {last_val} x{streak_len}",
+            last_val,
+            90,
+            "STREAK",
+            streak_len,
+        )
         if sig:
             signals.append(sig)
 
     alt_len = detect_alternating_pro(window)
     if alt_len and alt_len >= 6:
         pred = "T" if last_val == "X" else "X"
-        sig = make_signal(f"Cầu zigzag {last_val} x{alt_len}", pred, 86, "ZIGZAG", alt_len)
+        sig = make_signal(
+            f"Cầu zigzag {last_val} x{alt_len}",
+            pred,
+            86,
+            "ZIGZAG",
+            alt_len,
+        )
         if sig:
             signals.append(sig)
 
@@ -886,26 +1034,56 @@ def build_signal_bundle(seq: List[str]) -> Dict[str, Any]:
         motif_text = "-".join(motif)
         if len(motif) == 2 and motif[0] != motif[1]:
             pred = "T" if last_val == "X" else "X"
-            sig = make_signal(f"Cầu chu kỳ đảo {motif_text} x{rep}", pred, 84, "PERIODIC_FLIP", rep)
+            sig = make_signal(
+                f"Cầu chu kỳ đảo {motif_text} x{rep}",
+                pred,
+                84,
+                "PERIODIC_FLIP",
+                rep,
+            )
             if sig:
                 signals.append(sig)
         else:
             pred = motif[0]
-            sig = make_signal(f"Cầu chu kỳ {motif_text} x{rep}", pred, 82, "PERIODIC", rep)
+            sig = make_signal(
+                f"Cầu chu kỳ {motif_text} x{rep}",
+                pred,
+                82,
+                "PERIODIC",
+                rep,
+            )
             if sig:
                 signals.append(sig)
 
-    approx_motif, approx_rep = detect_approx_periodic_pro(window, min_period=2, max_period=6, min_repeats=3, max_mismatches=2)
+    approx_motif, approx_rep = detect_approx_periodic_pro(
+        window,
+        min_period=2,
+        max_period=6,
+        min_repeats=3,
+        max_mismatches=2,
+    )
     if approx_motif:
         motif_text = "-".join(approx_motif)
         if len(approx_motif) == 2 and approx_motif[0] != approx_motif[1]:
             pred = "T" if last_val == "X" else "X"
-            sig = make_signal(f"Cầu gần chu kỳ đảo {motif_text} x{approx_rep}", pred, 78, "NEAR_PERIODIC_FLIP", approx_rep)
+            sig = make_signal(
+                f"Cầu gần chu kỳ đảo {motif_text} x{approx_rep}",
+                pred,
+                78,
+                "NEAR_PERIODIC_FLIP",
+                approx_rep,
+            )
             if sig:
                 signals.append(sig)
         else:
             pred = approx_motif[0]
-            sig = make_signal(f"Cầu gần chu kỳ {motif_text} x{approx_rep}", pred, 76, "NEAR_PERIODIC", approx_rep)
+            sig = make_signal(
+                f"Cầu gần chu kỳ {motif_text} x{approx_rep}",
+                pred,
+                76,
+                "NEAR_PERIODIC",
+                approx_rep,
+            )
             if sig:
                 signals.append(sig)
 
@@ -926,7 +1104,13 @@ def build_signal_bundle(seq: List[str]) -> Dict[str, Any]:
             conf = 66
         else:
             conf = 60
-        sig = make_signal(length_sig, pred, conf, "LENGTH_SIGNATURE", sum(s[1] for s in segments[-6:]))
+        sig = make_signal(
+            length_sig,
+            pred,
+            conf,
+            "LENGTH_SIGNATURE",
+            sum(s[1] for s in segments[-6:]),
+        )
         if sig:
             signals.append(sig)
 
@@ -957,8 +1141,12 @@ def build_signal_bundle(seq: List[str]) -> Dict[str, Any]:
         if sig:
             signals.append(sig)
 
-    # Không dùng “bên nào nhiều dự đoán bên đó” làm tín hiệu dự đoán chính nữa.
-    # Chỉ giữ như thông tin nền để hiển thị nếu cần.
+    micro_pressure = detect_micro_pressure(window)
+    if micro_pressure:
+        pred, strength2, label = micro_pressure
+        sig = make_signal(label, pred, 66, "MICRO_PRESSURE", strength2)
+        if sig:
+            signals.append(sig)
 
     noise_score, noise_desc = detect_noise_score(window, segments)
     break_score, break_desc = detect_break_score(window, segments)
@@ -966,6 +1154,10 @@ def build_signal_bundle(seq: List[str]) -> Dict[str, Any]:
 
     pred, conf, score_t, score_x, total = matrix_vote(signals)
     matrix_text = build_matrix_preview(signals)
+
+    signal_count = len(signals)
+    family_count = len({s["family"] for s in signals}) if signals else 0
+    consensus = int(round((max(score_t, score_x) / total) * 100)) if total > 0 else 0
 
     recognized = bool(signals)
     blocked = False
@@ -975,8 +1167,8 @@ def build_signal_bundle(seq: List[str]) -> Dict[str, Any]:
         recognized = False
 
     if recognized and total > 0:
-        # Chặn nhiễu tự động: chuỗi quá nhiễu thì chỉ cho phép tín hiệu thật sự mạnh đi qua.
         best_conf = max((int(s["confidence"]) for s in signals), default=0)
+
         if noise_score >= 75 and best_conf < 88:
             blocked = True
             block_reason = "Nhiễu cao, chặn dự đoán"
@@ -1014,6 +1206,9 @@ def build_signal_bundle(seq: List[str]) -> Dict[str, Any]:
                 "matrix_score_t": score_t,
                 "matrix_score_x": score_x,
                 "matrix_total": total,
+                "matrix_signal_count": signal_count,
+                "matrix_family_count": family_count,
+                "matrix_consensus": consensus,
             }
         )
     else:
@@ -1031,6 +1226,9 @@ def build_signal_bundle(seq: List[str]) -> Dict[str, Any]:
                 "matrix_score_t": score_t,
                 "matrix_score_x": score_x,
                 "matrix_total": total,
+                "matrix_signal_count": signal_count,
+                "matrix_family_count": family_count,
+                "matrix_consensus": consensus,
             }
         )
         if signals:
@@ -1112,10 +1310,15 @@ def build_import_reply(
 
 
 def build_matrix_reply(analysis: Dict[str, Any]) -> str:
+    signal_count = analysis.get("matrix_signal_count", 0)
+    family_count = analysis.get("matrix_family_count", 0)
+    consensus = analysis.get("matrix_consensus", 0)
+
     if analysis["recognized"] and analysis["prediction"] in {"T", "X"}:
         out = [
             f"Ma trận tổng hợp: {fmt_outcome(analysis['prediction'])}",
             f"Độ tin cậy: {analysis['confidence']}%",
+            f"Đồng thuận: {consensus}% | Tín hiệu: {signal_count} | Nhóm cầu: {family_count}",
             f"Tổng điểm: T={analysis.get('matrix_score_t', 0)} | X={analysis.get('matrix_score_x', 0)} | Tổng={analysis.get('matrix_total', 0)}",
             f"Độ gãy cầu: {analysis.get('break_score', 0)}/100 ({analysis.get('break_desc', 'N/A')})",
             f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})",
@@ -1128,6 +1331,7 @@ def build_matrix_reply(analysis: Dict[str, Any]) -> str:
 
     out = [
         "Ma trận tổng hợp: Không dự đoán",
+        f"Đồng thuận: {consensus}% | Tín hiệu: {signal_count} | Nhóm cầu: {family_count}",
         f"Độ gãy cầu: {analysis.get('break_score', 0)}/100 ({analysis.get('break_desc', 'N/A')})",
         f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})",
         analysis.get("matrix_text", "Ma trận: Không có tín hiệu đủ mạnh"),
@@ -1186,6 +1390,7 @@ WELCOME = (
     "/stats [n]              - thống kê tần suất\n"
     "/scan [n]               - phân tích lịch sử\n"
     "/brain [n]              - xem bộ nhớ não\n"
+    "/matrix [n]             - xem ma trận tổng hợp\n"
     "/clear, /reset_history  - xóa lịch sử + kèo chờ, giữ não\n"
     "/reset_all              - xóa toàn bộ, gồm cả não\n\n"
     "Chỉ ADMIN mới dùng được."
@@ -1363,7 +1568,18 @@ async def matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await deny_if_not_admin(update)
     if not update.message:
         return
-    await update.message.reply_text("Chức năng ma trận đã được ẩn.")
+
+    n = 200
+    if context.args and context.args[0].isdigit():
+        n = max(1, min(2000, int(context.args[0])))
+
+    seq = load_history(n)
+    if not seq:
+        await update.message.reply_text("Chưa có dữ liệu.")
+        return
+
+    analysis = classify_pattern_pro(seq)
+    await update.message.reply_text(build_matrix_reply(analysis))
 
 
 async def brain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
