@@ -6,9 +6,16 @@ import re
 from pathlib import Path
 
 from telegram import Update
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-# ========== Load .env kiểu nhẹ, không cần python-dotenv ==========
+# ========= .env loader nhẹ =========
 def load_env_file(path: str = ".env") -> None:
     p = Path(path)
     if not p.exists():
@@ -68,7 +75,7 @@ def ensure_group_state() -> dict:
         STATE[key] = {
             "wins": 0,
             "losses": 0,
-            "busy": False,
+            "phase": "WAIT_MD5",   # WAIT_MD5 -> PREDICTING -> WAIT_RESULT
             "last_prediction": None,
             "last_score": None,
             "last_input": None,
@@ -84,7 +91,7 @@ def is_hex_input(text: str) -> bool:
 def predict_from_hex(hex_text: str):
     cleaned = hex_text.strip().lower()
     total = sum(int(ch, 16) for ch in cleaned)
-    score = (total % 16) + 3  # 3..18
+    score = (total % 16) + 3   # 3..18
     label = "TÀI" if score >= 11 else "XỈU"
     return cleaned, total, score, label
 
@@ -117,10 +124,10 @@ async def gsend(bot, text: str):
 async def prediction_flow(bot, hex_text: str):
     async with STATE_LOCK:
         ch = ensure_group_state()
-        if ch["busy"]:
-            await gsend(bot, "🕗 Đang xử lý phiên trước...")
+        if ch["phase"] != "WAIT_MD5":
             return
-        ch["busy"] = True
+
+        ch["phase"] = "PREDICTING"
         save_state(STATE)
 
     try:
@@ -136,7 +143,7 @@ async def prediction_flow(bot, hex_text: str):
             wins = ch["wins"]
             losses = ch["losses"]
 
-        # Mỗi dòng là 1 tin riêng
+        # Mỗi dòng là 1 tin nhắn riêng
         await gsend(bot, "🔍 Lấy Kết Quả Từ Hệ Thống...")
         await gsend(bot, "🌐 Nguồn: https://www.luckywin882.com/")
         await asyncio.sleep(1)
@@ -163,16 +170,16 @@ async def prediction_flow(bot, hex_text: str):
         async with STATE_LOCK:
             ch = ensure_group_state()
             rate = win_rate(ch["wins"], ch["losses"])
+            ch["phase"] = "WAIT_RESULT"
+            save_state(STATE)
 
         await gsend(bot, f"📣 Mọi người! Hãy chọn : {label}")
         await gsend(bot, f"🔍 Tỉ lệ thắng : {rate}%")
         await gsend(bot, "🕗 Chờ kết quả...")
 
     finally:
-        async with STATE_LOCK:
-            ch = ensure_group_state()
-            ch["busy"] = False
-            save_state(STATE)
+        # Không mở WAIT_MD5 ở đây, vì phải chờ admin nhập 6-5-4
+        pass
 
 
 async def check_admin_result(bot, text: str):
@@ -184,10 +191,13 @@ async def check_admin_result(bot, text: str):
 
     async with STATE_LOCK:
         ch = ensure_group_state()
-        predicted = ch["last_prediction"]
 
+        # Chỉ cho check khi đang chờ kết quả
+        if ch["phase"] != "WAIT_RESULT":
+            return True
+
+        predicted = ch["last_prediction"]
         if not predicted:
-            # Không có dự đoán trước đó thì không check
             return True
 
         ch["last_result"] = actual_label
@@ -199,11 +209,13 @@ async def check_admin_result(bot, text: str):
             ch["losses"] += 1
             status = "❌ DỰ ĐOÁN SAI"
 
-        save_state(STATE)
-
         wins = ch["wins"]
         losses = ch["losses"]
         rate = win_rate(wins, losses)
+
+        # Xong phiên, mở lại để nhận MD5 mới
+        ch["phase"] = "WAIT_MD5"
+        save_state(STATE)
 
     # Mỗi dòng là 1 tin riêng
     await gsend(bot, "🏆 KẾT QUẢ PHIÊN")
@@ -217,25 +229,15 @@ async def check_admin_result(bot, text: str):
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user and update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
-    await update.message.reply_text(
-        "Gửi MD5 hoặc nhập kết quả dạng 6-5-4 trong chat riêng này.\n"
-        "Bot sẽ tự đẩy nội dung sang group đã cấu hình."
-    )
+    # Không trả lời trong inbox nếu bạn không muốn
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user and update.effective_user.id != ADMIN_ID:
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
-
-    await update.message.reply_text(
-        "Lệnh dùng:\n"
-        "/reset  - reset thống kê\n"
-        "/stats  - xem thống kê\n\n"
-        "Nhắn 1 chuỗi MD5 hợp lệ để bot phân tích.\n"
-        "Nhắn 6-5-4 để bot tự check đúng/sai."
-    )
+    # Không trả lời trong inbox nếu bạn không muốn
 
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -246,7 +248,7 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATE[str(GROUP_ID)] = {
             "wins": 0,
             "losses": 0,
-            "busy": False,
+            "phase": "WAIT_MD5",
             "last_prediction": None,
             "last_score": None,
             "last_input": None,
@@ -267,32 +269,43 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         losses = ch["losses"]
         rate = win_rate(wins, losses)
 
-    await update.message.reply_text(
-        f"🔸 Tổng thắng: {wins}\n"
-        f"🔸 Tổng thua: {losses}\n"
-        f"🔍 Tỉ lệ thắng: {rate}%"
-    )
+    await gsend(context.bot, f"🔸 Tổng thắng: {wins}")
+    await gsend(context.bot, f"🔸 Tổng thua: {losses}")
+    await gsend(context.bot, f"🔍 Tỉ lệ thắng: {rate}%")
 
 
 async def private_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Chỉ nhận tin nhắn riêng của admin
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
 
     text = (update.message.text or "").strip()
 
-    # MD5 -> phân tích -> đẩy sang group
-    if is_hex_input(text):
+    # /reset
+    if text == "/reset":
+        await reset_cmd(update, context)
+        return
+
+    # /stats
+    if text == "/stats":
+        await stats_cmd(update, context)
+        return
+
+    # MD5 -> phân tích -> gửi sang group
+    async with STATE_LOCK:
+        phase = ensure_group_state()["phase"]
+
+    if phase == "WAIT_MD5" and is_hex_input(text):
         context.application.create_task(prediction_flow(context.bot, text))
         return
 
-    # Kết quả dạng 6-5-4 -> check -> đẩy sang group
-    if parse_result_text(text):
-        handled = await check_admin_result(context.bot, text)
-        if handled:
-            return
+    # 6-5-4 -> check -> gửi sang group
+    if phase == "WAIT_RESULT" and parse_result_text(text):
+        await check_admin_result(context.bot, text)
+        return
 
-    # Nếu nhập sai thì báo riêng trong inbox
-    await update.message.reply_text("Không tìm thấy dữ liệu hợp lệ.")
+    # Không trả lời inbox nếu nhập sai
+    return
 
 
 def main():
@@ -306,7 +319,7 @@ def main():
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
 
-    # Chỉ đọc tin nhắn riêng của admin
+    # Chỉ đọc chat riêng với bot
     app.add_handler(
         MessageHandler(
             filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
