@@ -1,1807 +1,295 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Telegram bot Tài/Xỉu theo lịch sử, có 2 lớp:
-- History: lịch sử nhập vào, có thể reset riêng
-- Brain: bộ nhớ pattern win/lose, giữ lại khi reset history
-
-Nâng cấp:
-- Ma trận tổng hợp nhiều tín hiệu pattern
-- Bảng cầu zigzag
-- Điểm độ gãy cầu
-- Chặn nhiễu mềm: vẫn dự đoán bình thường, chỉ giảm confidence khi nhiễu cao
-- Markov-2 + entropy + backtest
-"""
-
-from __future__ import annotations
-
+# bot.py
 import os
 import re
-import sqlite3
-import logging
-import asyncio
-import math
-from collections import Counter
-from typing import List, Optional, Tuple, Dict, Any
+import json
+import time
+import threading
+from pathlib import Path
 
-try:
-    from telegram import Update
-    from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-    TELEGRAM_AVAILABLE = True
-except ModuleNotFoundError:
-    TELEGRAM_AVAILABLE = False
-    from typing import Any as Update  # type: ignore
-    from types import SimpleNamespace
+import requests
+from dotenv import load_dotenv
 
-    class _TelegramUnavailable:
-        def __getattr__(self, name):
-            return SimpleNamespace(DEFAULT_TYPE=Any) if name == "DEFAULT_TYPE" else self
+load_dotenv()
 
-        def __call__(self, *args, **kwargs):
-            return self
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+GROUP_ID = int(os.getenv("GROUP_ID", "0").strip() or 0)
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or 0)
 
-    Application = CommandHandler = MessageHandler = filters = _TelegramUnavailable()
-    ContextTypes = SimpleNamespace(DEFAULT_TYPE=Any)
+if not BOT_TOKEN:
+    raise RuntimeError("Thiếu BOT_TOKEN trong file .env")
+if not GROUP_ID:
+    raise RuntimeError("Thiếu GROUP_ID trong file .env")
+if not ADMIN_ID:
+    raise RuntimeError("Thiếu ADMIN_ID trong file .env")
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-DB_PATH = os.getenv("TAI_XIU_DB_PATH", "tai_xiu_stats.db")
-PREDICT_DELAY_SECONDS = 0
-MIN_PREDICT_HISTORY = 20
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+STATE_FILE = Path("state.json")
 
-_admin_raw = os.getenv("ADMIN_USER_ID", "").strip()
-try:
-    ADMIN_USER_ID = int(_admin_raw) if _admin_raw else 0
-except ValueError:
-    ADMIN_USER_ID = 0
+HEX_RE = re.compile(r"^[0-9a-fA-F]{8,64}$")
+RESULT_RE = re.compile(r"^\s*(\d{1,2})\s*-\s*(\d{1,2})\s*-\s*(\d{1,2})\s*$")
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("tai_xiu_bot")
-DB_IO_LOCK = asyncio.Lock()
+lock = threading.Lock()
 
-# =========================
-# MATRIX UPGRADE
-# =========================
-MATRIX_SOURCE_BONUS = {
-    "STREAK": 1.18,
-    "SOFT_STREAK": 1.08,
-    "ZIGZAG": 1.16,
-    "PERIODIC": 1.12,
-    "PERIODIC_FLIP": 1.14,
-    "NEAR_PERIODIC": 1.04,
-    "NEAR_PERIODIC_FLIP": 1.06,
-    "BREAK": 1.14,
-    "TRANSITION": 1.05,
-    "LENGTH_SIGNATURE": 0.98,
-    "MIXED": 0.92,
-    "WEIGHTED_TREND": 0.88,
-    "MICRO_PRESSURE": 0.90,
-    "MARKOV": 1.20,
-}
 
-MATRIX_FAMILY_BONUS = {
-    "ZIGZAG": 1.12,
-    "BET_SOFT": 1.07,
-    "BET": 1.10,
-    "DAO_1_1": 1.13,
-    "CHU_KY_DAO": 1.12,
-    "CHU_KY": 1.10,
-    "GAN_CHU_KY_DAO": 1.05,
-    "GAN_CHU_KY": 1.03,
-    "TANG_TIEN": 1.02,
-    "GIAM_TIEN": 1.02,
-    "DOI_XUNG": 1.10,
-    "LUAN_PHIEN": 1.08,
-    "NHIP_DEU": 1.04,
-    "HON_HOP_BIEN_THE": 0.96,
-    "HON_HOP": 0.95,
-    "BE_CAU": 1.18,
-    "CHUYEN_CAU": 1.04,
-    "XU_HUONG_GAN": 0.98,
-    "XU_HUONG_NEN": 0.94,
-    "MARKOV": 1.10,
-    "MATRIX": 1.00,
-    "OTHER": 0.90,
-}
+def load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
 
-PREDICTION_NEVER_BLOCK = True
 
-# =========================
-# ADMIN CHECK
-# =========================
-def is_admin(update: Update) -> bool:
-    user = update.effective_user
-    return bool(user and user.id == ADMIN_USER_ID)
+def save_state(data):
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(STATE_FILE)
 
 
-async def deny_if_not_admin(update: Update):
-    if update.message:
-        await update.message.reply_text("Bot này chỉ dành cho ADMIN.")
+state = load_state()
 
 
-# =========================
-# DB
-# =========================
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=30000;")
-    return conn
-
-
-def init_db():
-    with get_conn() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS rounds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                raw TEXT NOT NULL,
-                outcome TEXT NOT NULL CHECK(outcome IN ('T', 'X'))
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS predictions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                based_on_count INTEGER NOT NULL,
-                pattern TEXT NOT NULL,
-                predicted_outcome TEXT NOT NULL CHECK(predicted_outcome IN ('T', 'X')),
-                confidence INTEGER NOT NULL,
-                resolved INTEGER NOT NULL DEFAULT 0,
-                actual_outcome TEXT,
-                correct INTEGER,
-                resolved_at TEXT
-            )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pattern_memory (
-                pattern_key TEXT PRIMARY KEY,
-                wins INTEGER NOT NULL DEFAULT 0,
-                losses INTEGER NOT NULL DEFAULT 0,
-                recent_losses INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        conn.commit()
-
-
-def save_outcomes(outcomes: List[str], raw: str) -> int:
-    if not outcomes:
-        return 0
-    with get_conn() as conn:
-        conn.executemany(
-            "INSERT INTO rounds(raw, outcome) VALUES(?, ?)",
-            [(raw, o) for o in outcomes],
-        )
-        conn.commit()
-    return len(outcomes)
-
-
-def reset_history_only():
-    with get_conn() as conn:
-        conn.execute("DELETE FROM rounds")
-        conn.execute("DELETE FROM predictions")
-        conn.commit()
-
-
-def reset_all():
-    with get_conn() as conn:
-        conn.execute("DELETE FROM rounds")
-        conn.execute("DELETE FROM predictions")
-        conn.execute("DELETE FROM pattern_memory")
-        conn.commit()
-
-
-def load_history(limit: int = 200) -> List[str]:
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT outcome FROM rounds ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-    return [r["outcome"] for r in reversed(rows)]
-
-
-def load_rows(limit: int = 20):
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT id, created_at, raw, outcome FROM rounds ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-    return list(reversed(rows))
-
-
-def count_saved_rounds() -> int:
-    with get_conn() as conn:
-        row = conn.execute("SELECT COUNT(*) AS c FROM rounds").fetchone()
-    return int(row["c"]) if row else 0
-
-
-def save_prediction(pattern: str, predicted_outcome: str, confidence: int, based_on_count: int):
-    with get_conn() as conn:
-        conn.execute(
-            """
-            INSERT INTO predictions(based_on_count, pattern, predicted_outcome, confidence)
-            VALUES(?, ?, ?, ?)
-            """,
-            (based_on_count, pattern, predicted_outcome, confidence),
-        )
-        conn.commit()
-
-
-def has_pending_prediction_for_count(based_on_count: int) -> bool:
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT 1
-            FROM predictions
-            WHERE resolved = 0 AND based_on_count = ?
-            LIMIT 1
-            """,
-            (based_on_count,),
-        ).fetchone()
-    return row is not None
-
-
-def reverse_outcome(v: str) -> str:
-    return "T" if v == "X" else "X"
-
-
-def clamp(value: int, low: int, high: int) -> int:
-    return max(low, min(high, value))
-
-
-def pattern_family(label: str) -> str:
-    t = (label or "").strip()
-    if t.startswith("Cầu zigzag"):
-        return "ZIGZAG"
-    if t.startswith("Cầu bệt vừa"):
-        return "BET_SOFT"
-    if t.startswith("Cầu bệt"):
-        return "BET"
-    if t.startswith("Cầu đảo 1-1"):
-        return "DAO_1_1"
-    if t.startswith("Cầu chu kỳ đảo"):
-        return "CHU_KY_DAO"
-    if t.startswith("Cầu chu kỳ"):
-        return "CHU_KY"
-    if t.startswith("Cầu gần chu kỳ đảo"):
-        return "GAN_CHU_KY_DAO"
-    if t.startswith("Cầu gần chu kỳ"):
-        return "GAN_CHU_KY"
-    if t.startswith("Cầu tăng tiến"):
-        return "TANG_TIEN"
-    if t.startswith("Cầu giảm tiến"):
-        return "GIAM_TIEN"
-    if t.startswith("Cầu đối xứng"):
-        return "DOI_XUNG"
-    if t.startswith("Cầu luân phiên"):
-        return "LUAN_PHIEN"
-    if t.startswith("Cầu nhịp đều"):
-        return "NHIP_DEU"
-    if t.startswith("Cầu hỗn hợp biến thể"):
-        return "HON_HOP_BIEN_THE"
-    if t.startswith("Cầu hỗn hợp"):
-        return "HON_HOP"
-    if t.startswith("Bẻ cầu"):
-        return "BE_CAU"
-    if t.startswith("Chuyển"):
-        return "CHUYEN_CAU"
-    if t.startswith("Xu hướng gần"):
-        return "XU_HUONG_GAN"
-    if t.startswith("Xu hướng nền"):
-        return "XU_HUONG_NEN"
-    if t.startswith("Ma trận"):
-        return "MATRIX"
-    if t.startswith("Cầu Markov"):
-        return "MARKOV"
-    return "OTHER"
-
-
-def get_pattern_memory(pattern_key: str) -> Optional[Dict[str, int]]:
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT wins, losses, recent_losses
-            FROM pattern_memory
-            WHERE pattern_key = ?
-            """,
-            (pattern_key,),
-        ).fetchone()
-    if not row:
-        return None
-    return {
-        "wins": int(row["wins"]),
-        "losses": int(row["losses"]),
-        "recent_losses": int(row["recent_losses"]),
-    }
-
-
-def update_pattern_memory(pattern_key: str, correct: bool):
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT wins, losses, recent_losses
-            FROM pattern_memory
-            WHERE pattern_key = ?
-            """,
-            (pattern_key,),
-        ).fetchone()
-
-        if row:
-            wins = int(row["wins"])
-            losses = int(row["losses"])
-            recent_losses = int(row["recent_losses"])
-        else:
-            wins = 0
-            losses = 0
-            recent_losses = 0
-
-        if correct:
-            wins += 1
-            recent_losses = 0
-        else:
-            losses += 1
-            recent_losses += 1
-
-        conn.execute(
-            """
-            INSERT INTO pattern_memory(pattern_key, wins, losses, recent_losses, updated_at)
-            VALUES(?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(pattern_key) DO UPDATE SET
-                wins = excluded.wins,
-                losses = excluded.losses,
-                recent_losses = excluded.recent_losses,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (pattern_key, wins, losses, recent_losses),
-        )
-        conn.commit()
-
-
-def resolve_pending_predictions(actual_outcomes: List[str]) -> List[Dict[str, Any]]:
-    if not actual_outcomes:
-        return []
-
-    resolved_rows: List[Dict[str, Any]] = []
-    memory_updates: List[Tuple[str, bool]] = []
-
-    with get_conn() as conn:
-        pending = conn.execute(
-            """
-            SELECT id, predicted_outcome, pattern, confidence
-            FROM predictions
-            WHERE resolved = 0
-            ORDER BY id ASC
-            """
-        ).fetchall()
-
-        for pred_row, actual in zip(pending, actual_outcomes):
-            correct = 1 if pred_row["predicted_outcome"] == actual else 0
-            conn.execute(
-                """
-                UPDATE predictions
-                SET resolved = 1,
-                    actual_outcome = ?,
-                    correct = ?,
-                    resolved_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (actual, correct, pred_row["id"]),
-            )
-            resolved_rows.append(
-                {
-                    "predicted_outcome": pred_row["predicted_outcome"],
-                    "actual_outcome": actual,
-                    "correct": bool(correct),
-                    "pattern": pred_row["pattern"],
-                    "confidence": int(pred_row["confidence"]),
-                }
-            )
-            memory_updates.append((pattern_family(pred_row["pattern"]), bool(correct)))
-
-        conn.commit()
-
-    for key, correct in memory_updates:
-        update_pattern_memory(key, correct)
-
-    return resolved_rows
-
-
-def get_prediction_stats() -> Tuple[int, int]:
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT
-                COUNT(*) AS total,
-                COALESCE(SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END), 0) AS wins
-            FROM predictions
-            WHERE resolved = 1
-            """
-        ).fetchone()
-    total = int(row["total"]) if row else 0
-    wins = int(row["wins"]) if row else 0
-    losses = max(0, total - wins)
-    return wins, losses
-
-
-def get_latest_resolution() -> Optional[Dict[str, Any]]:
-    with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT predicted_outcome, actual_outcome, correct, pattern, confidence
-            FROM predictions
-            WHERE resolved = 1
-            ORDER BY id DESC
-            LIMIT 1
-            """
-        ).fetchone()
-
-    if not row:
-        return None
-
-    return {
-        "predicted_outcome": row["predicted_outcome"],
-        "actual_outcome": row["actual_outcome"],
-        "correct": bool(row["correct"]),
-        "pattern": row["pattern"],
-        "confidence": int(row["confidence"]),
-    }
-
-
-def get_brain_rows(limit: int = 10):
-    with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT pattern_key, wins, losses, recent_losses, updated_at
-            FROM pattern_memory
-            ORDER BY (wins + losses) DESC, updated_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-    return rows
-
-
-def count_brain_patterns() -> int:
-    with get_conn() as conn:
-        row = conn.execute("SELECT COUNT(*) AS c FROM pattern_memory").fetchone()
-    return int(row["c"]) if row else 0
-
-
-# =========================
-# PARSE
-# =========================
-TOKEN_RE = re.compile(r"\b(?:TÀI|TAI|XỈU|XIU|T|X|\d+)\b", re.UNICODE)
-
-
-def normalize_token(token: str) -> Optional[str]:
-    t = token.strip().upper()
-    if t in {"T", "TAI", "TÀI"}:
-        return "T"
-    if t in {"X", "XIU", "XỈU"}:
-        return "X"
-    if t.isdigit() and 1 <= len(t) <= 2:
-        n = int(t)
-        if 3 <= n <= 10:
-            return "X"
-        if 11 <= n <= 18:
-            return "T"
-        return None
-    return None
-
-
-def extract_outcomes(text: str) -> List[str]:
-    if not text:
-        return []
-    tokens = TOKEN_RE.findall(text.upper())
-    results = []
-    for tok in tokens:
-        mapped = normalize_token(tok)
-        if mapped in {"T", "X"}:
-            results.append(mapped)
-    return results
-
-
-def fmt_outcome(v: str) -> str:
-    return "Tài" if v == "T" else "Xỉu"
-
-
-# =========================
-# PATTERN HELPERS
-# =========================
-def rle(seq: List[str]) -> List[Tuple[str, int]]:
-    if not seq:
-        return []
-    out = []
-    cur = seq[0]
-    cnt = 1
-    for x in seq[1:]:
-        if x == cur:
-            cnt += 1
-        else:
-            out.append((cur, cnt))
-            cur = x
-            cnt = 1
-    out.append((cur, cnt))
-    return out
-
-
-def current_streak(seq: List[str]) -> Tuple[str, int]:
-    if not seq:
-        return ("", 0)
-    last = seq[-1]
-    count = 1
-    for i in range(len(seq) - 2, -1, -1):
-        if seq[i] == last:
-            count += 1
-        else:
-            break
-    return (last, count)
-
-
-def detect_soft_streak(seq: List[str]) -> Optional[int]:
-    if len(seq) < 3:
-        return None
-    count = 1
-    last = seq[-1]
-    for i in range(len(seq) - 2, -1, -1):
-        if seq[i] == last:
-            count += 1
-        else:
-            break
-    return count if 3 <= count < 5 else None
-
-
-def detect_alternating_pro(seq: List[str]) -> Optional[int]:
-    if len(seq) < 6:
-        return None
-    tail = seq[-8:]
-    if len(tail) < 6:
-        return None
-    mismatches = sum(1 for i in range(len(tail) - 1) if tail[i] == tail[i + 1])
-    if mismatches <= 1:
-        length = len(tail)
-        i = len(seq) - len(tail) - 1
-        while i >= 0 and seq[i] != seq[i + 1]:
-            length += 1
-            i -= 1
-        return length
-    return None
-
-
-def detect_exact_periodic_pro(seq: List[str], min_period: int = 2, max_period: int = 6, min_repeats: int = 3):
-    n = len(seq)
-    for period in range(min_period, max_period + 1):
-        for repeats in range(min_repeats, min(8, n // period) + 1):
-            need = period * repeats
-            if n < need:
-                continue
-            tail = seq[-need:]
-            motif = tail[:period]
-            if all(tail[i] == motif[i % period] for i in range(need)):
-                return motif, repeats
-    return None, 0
-
-
-def detect_approx_periodic_pro(seq: List[str], min_period: int = 2, max_period: int = 6, min_repeats: int = 3, max_mismatches: int = 2):
-    n = len(seq)
-    best_motif = None
-    best_repeats = 0
-    best_score = -10**9
-    for period in range(min_period, max_period + 1):
-        for repeats in range(min_repeats, min(8, n // period) + 1):
-            need = period * repeats
-            if n < need:
-                continue
-            tail = seq[-need:]
-            motif = tail[:period]
-            mismatches = 0
-            for i, x in enumerate(tail):
-                if x != motif[i % period]:
-                    mismatches += 1
-            if mismatches <= max_mismatches:
-                score = repeats * 10 - period * 2 - mismatches * 5
-                if score > best_score:
-                    best_score = score
-                    best_motif = motif
-                    best_repeats = repeats
-    return best_motif, best_repeats
-
-
-def detect_length_signature_pro(segments: List[Tuple[str, int]]) -> Optional[str]:
-    if len(segments) < 3:
-        return None
-    tail = [s[1] for s in segments[-8:]]
-    if len(tail) >= 4 and all(tail[i] < tail[i + 1] for i in range(len(tail) - 1)):
-        return f"Cầu tăng tiến {'-'.join(map(str, tail))}"
-    if len(tail) >= 4 and all(tail[i] > tail[i + 1] for i in range(len(tail) - 1)):
-        return f"Cầu giảm tiến {'-'.join(map(str, tail))}"
-    if len(tail) >= 5 and tail == tail[::-1]:
-        return f"Cầu đối xứng {'-'.join(map(str, tail))}"
-    if len(tail) >= 4 and tail[0] == tail[2] and tail[1] == tail[3]:
-        return f"Cầu luân phiên {'-'.join(map(str, tail))}"
-    if len(set(tail)) == 1:
-        return f"Cầu nhịp đều {'-'.join(map(str, tail))}"
-    if len(set(tail)) >= 5:
-        return f"Cầu hỗn hợp {'-'.join(map(str, tail))}"
-    return None
-
-
-def detect_mixed_pattern_pro(seq: List[str], segments: List[Tuple[str, int]]) -> Optional[str]:
-    if len(seq) < 8 or len(segments) < 4:
-        return None
-    tail_lengths = [s[1] for s in segments[-6:]]
-    if len(tail_lengths) < 4:
-        return None
-    unique_count = len(set(tail_lengths))
-    variance = max(tail_lengths) - min(tail_lengths)
-    if 2 <= unique_count <= 4 and variance >= 2:
-        return f"Cầu hỗn hợp biến thể {'-'.join(map(str, tail_lengths))}"
-    return None
-
-
-def detect_break_pro(seq: List[str], segments: List[Tuple[str, int]]) -> Optional[str]:
-    if len(seq) < 5 or len(segments) < 2:
-        return None
-    prev_val, prev_len = segments[-2]
-    cur_val, cur_len = segments[-1]
-    if prev_len >= 5 and cur_len == 1:
-        return f"Bẻ cầu yếu sau bệt {prev_val} x{prev_len}"
-    if prev_len >= 5 and cur_len == 2:
-        return f"Bẻ cầu mạnh sau bệt {prev_val} x{prev_len}"
-    if prev_len >= 4 and cur_len == 1:
-        return f"Bẻ cầu sau bệt {prev_val} x{prev_len}"
-    return None
-
-
-def detect_transition_pro(segments: List[Tuple[str, int]]) -> Optional[str]:
-    if len(segments) < 3:
-        return None
-    a, b, c = segments[-3:]
-    if a[1] >= 4 and b[1] == 1 and c[1] == 1:
-        return f"Chuyển bệt -> đảo ({a[0]} -> {c[0]})"
-    if a[1] == 1 and b[1] == 1 and c[1] >= 3:
-        return f"Chuyển đảo -> bệt ({a[0]} -> {c[0]})"
-    if a[1] >= 4 and b[1] >= 2 and c[1] >= 2:
-        return f"Chuyển bệt -> chu kỳ ({a[0]} -> {c[0]})"
-    return None
-
-
-def weighted_trend(seq: List[str], window: int = 20) -> Tuple[Optional[str], int]:
-    tail = seq[-window:]
-    if not tail:
-        return None, 0
-    score = 0
-    for i, v in enumerate(reversed(tail)):
-        w = i + 1
-        score += w if v == "T" else -w
-    trend = "T" if score > 0 else "X"
-    return trend, abs(score)
-
-
-def binary_entropy(seq: List[str], window: int = 40) -> float:
-    """
-    Entropy nhị phân chuẩn hóa 0..1.
-    Gần 1 = rất nhiễu, gần 0 = ít biến động.
-    """
-    tail = seq[-window:]
-    if len(tail) < 2:
-        return 0.0
-
-    c = Counter(tail)
-    total = len(tail)
-    ent = 0.0
-    for key in ("T", "X"):
-        p = c[key] / total
-        if p > 0:
-            ent -= p * math.log2(p)
-    return ent
-
-
-def markov_predict(seq: List[str], order: int = 2, window: int = 120) -> Tuple[Optional[str], float, int]:
-    """
-    Dự đoán theo Markov n-gram.
-    """
-    tail = seq[-window:]
-    if len(tail) < order + 8:
-        return None, 0.0, 0
-
-    suffix = tuple(tail[-order:])
-    counts = Counter()
-
-    for i in range(len(tail) - order):
-        if tuple(tail[i:i + order]) == suffix:
-            nxt = tail[i + order]
-            counts[nxt] += 1
-
-    support = counts["T"] + counts["X"]
-    if support <= 0:
-        return None, 0.0, 0
-
-    pred = "T" if counts["T"] >= counts["X"] else "X"
-    prob = (max(counts["T"], counts["X"]) + 1) / (support + 2)
-    return pred, prob, support
-
-
-def detect_noise_score(seq: List[str], segments: List[Tuple[str, int]]) -> Tuple[int, str]:
-    if len(seq) < 4:
-        return 65, "Chuỗi quá ngắn"
-
-    changes = sum(1 for i in range(1, len(seq)) if seq[i] != seq[i - 1])
-    change_rate = changes / max(1, len(seq) - 1)
-    singletons = sum(1 for _, ln in segments if ln == 1)
-    singleton_ratio = singletons / max(1, len(segments))
-    short_runs = sum(1 for _, ln in segments if ln <= 2)
-    short_ratio = short_runs / max(1, len(segments))
-    longest = max((ln for _, ln in segments), default=1)
-    balance_gap = abs(seq.count("T") - seq.count("X")) / max(1, len(seq))
-    ent = binary_entropy(seq, window=min(40, len(seq)))
-
-    score = int(
-        ent * 34
-        + change_rate * 30
-        + singleton_ratio * 18
-        + short_ratio * 10
-        + (1 - min(longest, 10) / 10) * 10
-        + balance_gap * 8
-    )
-    score = clamp(score, 0, 100)
-
-    if score >= 75:
-        reason = "Nhiễu rất cao"
-    elif score >= 60:
-        reason = "Nhiễu trung bình"
-    else:
-        reason = "Nhiễu thấp"
-    return score, reason
-
-
-def detect_break_score(seq: List[str], segments: List[Tuple[str, int]]) -> Tuple[int, str]:
-    if len(seq) < 5 or len(segments) < 2:
-        return 0, "Không đủ dữ liệu"
-
-    prev_val, prev_len = segments[-2]
-    cur_val, cur_len = segments[-1]
-    recent = segments[-6:]
-    singleton_tail = sum(1 for _, ln in recent if ln == 1)
-    short_tail = sum(1 for _, ln in recent if ln <= 2)
-
-    score = 0
-    if prev_len >= 6 and cur_len == 1:
-        score += 45
-    elif prev_len >= 5 and cur_len <= 2:
-        score += 35
-    elif prev_len >= 4 and cur_len == 1:
-        score += 25
-
-    if singleton_tail >= 3:
-        score += 15
-    if short_tail >= 4:
-        score += 10
-    if len(segments) >= 4 and segments[-3][1] >= 4 and segments[-2][1] == 1 and segments[-1][1] == 1:
-        score += 10
-    if cur_len == 1 and cur_val != prev_val:
-        score += 5
-
-    score = clamp(score, 0, 100)
-    if score >= 70:
-        desc = "Gãy mạnh"
-    elif score >= 45:
-        desc = "Gãy vừa"
-    elif score > 0:
-        desc = "Gãy nhẹ"
-    else:
-        desc = "Ổn định"
-    return score, desc
-
-
-def build_zigzag_table(seq: List[str], limit_segments: int = 10) -> str:
-    if not seq:
-        return "Chưa có dữ liệu zigzag."
-    segs = rle(seq[-80:])
-    if not segs:
-        return "Chưa có dữ liệu zigzag."
-
-    tail = segs[-limit_segments:]
-    lines = ["Bảng cầu zigzag:"]
-    for idx, (val, ln) in enumerate(tail, start=max(1, len(segs) - len(tail) + 1)):
-        arrow = "↗" if val == "T" else "↘"
-        lines.append(f"{idx:>2}. {fmt_outcome(val):<4} | x{ln:<2} | {arrow}")
-    return "\n".join(lines)
-
-
-def matrix_source_bonus(source: str) -> float:
-    return MATRIX_SOURCE_BONUS.get(source, 1.0)
-
-
-def matrix_family_bonus(family: str) -> float:
-    return MATRIX_FAMILY_BONUS.get(family, 1.0)
-
-
-def matrix_effective_weight(signal: Dict[str, Any]) -> int:
-    conf = clamp(int(signal.get("confidence", 0)), 0, 100)
-    weight = max(1, int(signal.get("weight", 1)))
-    source = str(signal.get("source", ""))
-    family = str(signal.get("family", ""))
-
-    base = weight * (0.78 + conf / 260.0)
-    base *= matrix_source_bonus(source)
-    base *= matrix_family_bonus(family)
-
-    if signal.get("flipped"):
-        base *= 0.97
-
-    return max(1, int(round(base)))
-
-
-def detect_micro_pressure(seq: List[str]) -> Optional[Tuple[str, int, str]]:
-    if len(seq) < 8:
-        return None
-
-    tail = seq[-12:]
-    if len(tail) < 8:
-        return None
-
-    t = tail.count("T")
-    x = tail.count("X")
-    gap = abs(t - x)
-
-    if gap < 4:
-        return None
-
-    pred = "T" if t > x else "X"
-    strength = gap * 2 + (3 if tail[-3:] == [pred] * 3 else 0)
-    label = f"Ma trận vi mô {fmt_outcome(pred)}"
-    return pred, strength, label
-
-
-def build_matrix_preview(signals: List[Dict[str, Any]], limit: int = 6) -> str:
-    if not signals:
-        return "Ma trận: Không có tín hiệu đủ mạnh"
-
-    ordered = sorted(
-        signals,
-        key=lambda s: (
-            int(s.get("effective_weight", s.get("weight", 0))),
-            int(s.get("confidence", 0)),
-        ),
-        reverse=True,
-    )
-
-    lines = ["Ma trận tín hiệu:"]
-    for s in ordered[:limit]:
-        pred = fmt_outcome(s["predicted_outcome"]) if s["predicted_outcome"] in {"T", "X"} else "-"
-        ew = int(s.get("effective_weight", s.get("weight", 0)))
-        lines.append(
-            f"- {s['pattern_label']} [{s['family']}] ({s['source']}) -> {pred} | "
-            f"{s['confidence']}% | w={s['weight']} | ew={ew}"
-        )
-    return "\n".join(lines)
-
-
-def build_extra_report(analysis: Dict[str, Any]) -> str:
-    lines = []
-    lines.append(f"Độ gãy cầu: {analysis.get('break_score', 0)}/100 ({analysis.get('break_desc', 'N/A')})")
-    lines.append(f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})")
-    if analysis.get("blocked"):
-        lines.append(f"Chặn nhiễu: {analysis.get('block_reason', 'Đã chặn')}")
-    if analysis.get("zigzag_text"):
-        lines.append(analysis["zigzag_text"])
-    return "\n".join(lines)
-
-
-def make_signal(label: str, predicted_outcome: Optional[str], confidence: int, source: str, strength: int) -> Optional[Dict[str, Any]]:
-    if predicted_outcome not in {"T", "X"}:
-        return None
-
-    adjusted_pred, adjusted_conf, flipped, reason = adjust_prediction_by_memory(label, predicted_outcome, confidence)
-    weight = max(1, int(round(adjusted_conf + min(strength, 12) * 2)))
-    return {
-        "pattern_label": label,
-        "predicted_outcome": adjusted_pred,
-        "confidence": adjusted_conf,
-        "source": source,
-        "strength": strength,
-        "weight": weight,
-        "flipped": flipped,
-        "flip_reason": reason if flipped else "",
-        "family": pattern_family(label),
-    }
-
-
-def smart_final_vote(signals: List[Dict[str, Any]]) -> Tuple[Optional[str], int, int, int, int]:
-    if not signals:
-        return None, 0, 0, 0, 0
-
-    grouped: Dict[str, Dict[str, Any]] = {}
-
-    for s in signals:
-        family = s.get("family", "OTHER")
-        enriched = dict(s)
-        enriched["effective_weight"] = matrix_effective_weight(enriched)
-
-        current = grouped.get(family)
-        if current is None:
-            grouped[family] = enriched
-            continue
-
-        if (
-            enriched["effective_weight"] > current["effective_weight"]
-            or (
-                enriched["effective_weight"] == current["effective_weight"]
-                and int(enriched.get("confidence", 0)) > int(current.get("confidence", 0))
-            )
-        ):
-            grouped[family] = enriched
-
-    chosen = list(grouped.values())
-    if not chosen:
-        return None, 0, 0, 0, 0
-
-    score_t = sum(int(s["effective_weight"]) for s in chosen if s["predicted_outcome"] == "T")
-    score_x = sum(int(s["effective_weight"]) for s in chosen if s["predicted_outcome"] == "X")
-    total = score_t + score_x
-
-    if total <= 0:
-        return None, 0, score_t, score_x, total
-
-    pred = "T" if score_t >= score_x else "X"
-    share = max(score_t, score_x) / total
-    margin = abs(score_t - score_x) / total
-    family_cnt = len(chosen)
-
-    confidence = clamp(
-        int(round(38 + share * 28 + margin * 32 + min(family_cnt, 6) * 2)),
-        0,
-        100,
-    )
-
-    if family_cnt >= 5:
-        confidence = clamp(confidence + 3, 0, 100)
-    if total < 120:
-        confidence = clamp(confidence - 5, 0, 100)
-
-    return pred, confidence, score_t, score_x, total
-
-
-def adjust_prediction_by_memory(pattern_label: str, predicted_outcome: Optional[str], confidence: int) -> Tuple[Optional[str], int, bool, str]:
-    try:
-        if not pattern_label or predicted_outcome not in {"T", "X"}:
-            return predicted_outcome, confidence, False, "NO_MEMORY"
-
-        key = pattern_family(pattern_label)
-        mem = get_pattern_memory(key)
-        if not mem:
-            return predicted_outcome, confidence, False, "NO_MEMORY"
-
-        wins = int(mem["wins"])
-        losses = int(mem["losses"])
-        recent_losses = int(mem["recent_losses"])
-        total = wins + losses
-        if total <= 0:
-            return predicted_outcome, confidence, False, "NO_MEMORY"
-
-        win_rate = (wins + 1) / (total + 2)
-        adjusted_conf = int(confidence)
-
-        if total >= 10:
-            if win_rate >= 0.62:
-                adjusted_conf += 6
-            elif win_rate <= 0.38:
-                adjusted_conf -= 8
-            else:
-                adjusted_conf -= 3
-
-        flip = False
-        reason = "FOLLOW"
-        if total >= 8 and recent_losses >= 4 and win_rate < 0.45:
-            flip = True
-            reason = "RECENT_LOSS_STRONG"
-
-        if flip:
-            predicted_outcome = reverse_outcome(predicted_outcome)
-            adjusted_conf -= 4
-
-        adjusted_conf = clamp(adjusted_conf, 0, 100)
-        return predicted_outcome, adjusted_conf, flip, reason
-
-    except Exception as e:
-        logger.exception("Lỗi adjust_prediction_by_memory: %s", e)
-        return predicted_outcome, confidence, False, "ERROR"
-
-
-def build_signal_bundle(seq: List[str]) -> Dict[str, Any]:
-    result: Dict[str, Any] = {
-        "pattern_label": "Không nhận diện được cầu",
-        "prediction": None,
-        "confidence": 0,
-        "recognized": False,
-        "flipped": False,
-        "flip_reason": "",
-        "follow_pct": 0,
-        "reverse_pct": 0,
-        "source": "",
-        "signals": [],
-        "matrix_text": "",
-        "zigzag_text": "",
-        "break_score": 0,
-        "break_desc": "",
-        "noise_score": 0,
-        "noise_desc": "",
-        "blocked": False,
-        "block_reason": "",
-        "matrix_score_t": 0,
-        "matrix_score_x": 0,
-        "matrix_total": 0,
-        "matrix_signal_count": 0,
-        "matrix_family_count": 0,
-        "matrix_consensus": 0,
-        "markov_pred": None,
-        "markov_prob": 0.0,
-        "markov_support": 0,
-        "risk_tag": "",
-    }
-
-    if len(seq) < 5:
-        result["noise_score"], result["noise_desc"] = detect_noise_score(seq, rle(seq))
-        result["zigzag_text"] = build_zigzag_table(seq)
-        return result
-
-    window = seq[-60:]
-    segments = rle(window)
-    last_val, streak_len = current_streak(window)
-    signals: List[Dict[str, Any]] = []
-
-    soft_streak = detect_soft_streak(window)
-    if soft_streak and soft_streak >= 3:
-        sig = make_signal(
-            f"Cầu bệt vừa {last_val} x{soft_streak}",
-            last_val,
-            80,
-            "SOFT_STREAK",
-            soft_streak,
-        )
-        if sig:
-            signals.append(sig)
-
-    if streak_len >= 5:
-        sig = make_signal(
-            f"Cầu bệt {last_val} x{streak_len}",
-            last_val,
-            90,
-            "STREAK",
-            streak_len,
-        )
-        if sig:
-            signals.append(sig)
-
-    alt_len = detect_alternating_pro(window)
-    if alt_len and alt_len >= 6:
-        pred = "T" if last_val == "X" else "X"
-        sig = make_signal(
-            f"Cầu zigzag {last_val} x{alt_len}",
-            pred,
-            86,
-            "ZIGZAG",
-            alt_len,
-        )
-        if sig:
-            signals.append(sig)
-
-    motif, rep = detect_exact_periodic_pro(window, min_period=2, max_period=6, min_repeats=3)
-    if motif:
-        motif_text = "-".join(motif)
-        if len(motif) == 2 and motif[0] != motif[1]:
-            pred = "T" if last_val == "X" else "X"
-            sig = make_signal(
-                f"Cầu chu kỳ đảo {motif_text} x{rep}",
-                pred,
-                84,
-                "PERIODIC_FLIP",
-                rep,
-            )
-            if sig:
-                signals.append(sig)
-        else:
-            pred = motif[0]
-            sig = make_signal(
-                f"Cầu chu kỳ {motif_text} x{rep}",
-                pred,
-                82,
-                "PERIODIC",
-                rep,
-            )
-            if sig:
-                signals.append(sig)
-
-    approx_motif, approx_rep = detect_approx_periodic_pro(
-        window,
-        min_period=2,
-        max_period=6,
-        min_repeats=3,
-        max_mismatches=2,
-    )
-    if approx_motif:
-        motif_text = "-".join(approx_motif)
-        if len(approx_motif) == 2 and approx_motif[0] != approx_motif[1]:
-            pred = "T" if last_val == "X" else "X"
-            sig = make_signal(
-                f"Cầu gần chu kỳ đảo {motif_text} x{approx_rep}",
-                pred,
-                78,
-                "NEAR_PERIODIC_FLIP",
-                approx_rep,
-            )
-            if sig:
-                signals.append(sig)
-        else:
-            pred = approx_motif[0]
-            sig = make_signal(
-                f"Cầu gần chu kỳ {motif_text} x{approx_rep}",
-                pred,
-                76,
-                "NEAR_PERIODIC",
-                approx_rep,
-            )
-            if sig:
-                signals.append(sig)
-
-    length_sig = detect_length_signature_pro(segments)
-    if length_sig:
-        pred = last_val if last_val in {"T", "X"} else None
-        if "đối xứng" in length_sig:
-            conf = 80
-        elif "luân phiên" in length_sig:
-            conf = 77
-        elif "tăng tiến" in length_sig:
-            conf = 72
-        elif "giảm tiến" in length_sig:
-            conf = 72
-        elif "nhịp đều" in length_sig:
-            conf = 74
-        elif "hỗn hợp" in length_sig:
-            conf = 66
-        else:
-            conf = 60
-        sig = make_signal(
-            length_sig,
-            pred,
-            conf,
-            "LENGTH_SIGNATURE",
-            sum(s[1] for s in segments[-6:]),
-        )
-        if sig:
-            signals.append(sig)
-
-    mixed = detect_mixed_pattern_pro(window, segments)
-    if mixed:
-        pred = last_val if last_val in {"T", "X"} else None
-        sig = make_signal(mixed, pred, 63, "MIXED", len(segments))
-        if sig:
-            signals.append(sig)
-
-    break_type = detect_break_pro(window, segments)
-    if break_type:
-        pred = reverse_outcome(last_val) if last_val in {"T", "X"} else None
-        sig = make_signal(break_type, pred, 73, "BREAK", segments[-1][1])
-        if sig:
-            signals.append(sig)
-
-    transition = detect_transition_pro(segments)
-    if transition:
-        pred = last_val if last_val in {"T", "X"} else None
-        sig = make_signal(transition, pred, 70, "TRANSITION", sum(s[1] for s in segments[-3:]))
-        if sig:
-            signals.append(sig)
-
-    trend, strength = weighted_trend(window, window=20)
-    if trend and strength >= 15:
-        sig = make_signal(f"Xu hướng gần {trend}", trend, 60, "WEIGHTED_TREND", strength)
-        if sig:
-            signals.append(sig)
-
-    micro_pressure = detect_micro_pressure(window)
-    if micro_pressure:
-        pred, strength2, label = micro_pressure
-        sig = make_signal(label, pred, 66, "MICRO_PRESSURE", strength2)
-        if sig:
-            signals.append(sig)
-
-    markov_pred, markov_prob, markov_support = markov_predict(window, order=2, window=120)
-    if markov_pred and markov_prob >= 0.58:
-        sig = make_signal(
-            f"Cầu Markov {fmt_outcome(markov_pred)}",
-            markov_pred,
-            int(round(markov_prob * 100)),
-            "MARKOV",
-            max(1, markov_support),
-        )
-        if sig:
-            signals.append(sig)
-
-    noise_score, noise_desc = detect_noise_score(window, segments)
-    break_score, break_desc = detect_break_score(window, segments)
-    zigzag_text = build_zigzag_table(window)
-
-    pred, conf, score_t, score_x, total = smart_final_vote(signals)
-    matrix_text = build_matrix_preview(signals)
-
-    signal_count = len(signals)
-    family_count = len({s["family"] for s in signals}) if signals else 0
-    consensus = int(round((max(score_t, score_x) / total) * 100)) if total > 0 else 0
-
-    conf = clamp(
-        int(round(
-            conf
-            - (12 if noise_score >= 80 else 8 if noise_score >= 65 else 3 if noise_score >= 50 else 0)
-            + (6 if consensus >= 75 else 0)
-            - (6 if consensus <= 55 else 0)
-            + (int((markov_prob - 0.5) * 20) if markov_support >= 4 else 0)
-        )),
-        0,
-        100,
-    )
-
-    recognized = bool(signals) and pred in {"T", "X"}
-    blocked = False
-    block_reason = ""
-
-    # Không hard-stop: chỉ gắn cảnh báo, vẫn ra kèo
-    if recognized and total > 0:
-        if noise_score >= 80:
-            block_reason = "Nhiễu rất cao, đã giảm độ tin cậy"
-        elif noise_score >= 65:
-            block_reason = "Nhiễu trung bình/cao, đã giảm độ tin cậy"
-
-    result.update(
-        {
-            "pattern_label": signals[0]["pattern_label"] if signals else "Không nhận diện được cầu",
-            "prediction": pred,
-            "confidence": conf,
-            "recognized": recognized,
-            "flipped": False,
-            "flip_reason": "",
-            "follow_pct": conf if recognized else 0,
-            "reverse_pct": max(0, min(100, 100 - conf)) if recognized else 0,
-            "source": "MATRIX",
-            "signals": signals,
-            "matrix_text": matrix_text,
-            "zigzag_text": zigzag_text,
-            "break_score": break_score,
-            "break_desc": break_desc,
-            "noise_score": noise_score,
-            "noise_desc": noise_desc,
-            "blocked": blocked,
-            "block_reason": block_reason,
-            "matrix_score_t": score_t,
-            "matrix_score_x": score_x,
-            "matrix_total": total,
-            "matrix_signal_count": signal_count,
-            "matrix_family_count": family_count,
-            "matrix_consensus": consensus,
-            "markov_pred": markov_pred,
-            "markov_prob": markov_prob,
-            "markov_support": markov_support,
-            "risk_tag": "NHIỄU_CAO" if noise_score >= 75 else ("NHIỄU_TRUNG_BINH" if noise_score >= 60 else "NHIỄU_THẤP"),
+def ensure_group_state():
+    key = str(GROUP_ID)
+    if key not in state:
+        state[key] = {
+            "wins": 0,
+            "losses": 0,
+            "busy": False,
+            "last_prediction": None,
+            "last_score": None,
+            "last_input": None,
+            "last_result": None,
         }
+    return state[key]
+
+
+def send_message(text):
+    r = requests.post(
+        f"{API}/sendMessage",
+        json={
+            "chat_id": GROUP_ID,
+            "text": text,
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
     )
-
-    if recognized and pred not in {"T", "X"}:
-        result["recognized"] = False
-    return result
+    r.raise_for_status()
+    return r.json()
 
 
-def classify_pattern_pro(seq: List[str]) -> Dict[str, Any]:
-    return build_signal_bundle(seq)
+def is_hex_input(text):
+    return bool(HEX_RE.fullmatch(text.strip()))
 
 
-# =========================
-# OUTPUT BUILDERS
-# =========================
-def build_live_reply(
-    inserted_count: int,
-    total_saved: int,
-    latest_resolution: Optional[Dict[str, Any]],
-    wins: int,
-    losses: int,
-    analysis: Dict[str, Any],
-) -> str:
-    if latest_resolution:
-        pred = fmt_outcome(latest_resolution["predicted_outcome"])
-        actual = fmt_outcome(latest_resolution["actual_outcome"])
-        result_text = "ĐÚNG" if latest_resolution["correct"] else "SAI"
-        section2 = f"Kèo trước: {pred} → {actual} | {result_text}"
-    else:
-        section2 = "Kèo trước: Chưa có kèo trước để chốt"
-
-    section3 = f"Thắng/Thua: Thắng {wins} | Thua {losses}"
-
-    if analysis["recognized"]:
-        section4 = f"Cầu: {analysis['pattern_label']}"
-    else:
-        section4 = "Cầu: Không nhận diện được cầu"
-
-    if analysis["recognized"] and analysis["prediction"] in {"T", "X"}:
-        final_txt = fmt_outcome(analysis["prediction"])
-        section5 = (
-            f"Dự đoán mới: {final_txt} | Độ tin cậy: {analysis['confidence']}%\n"
-            f"Tỷ lệ: Theo {analysis['follow_pct']}% | Bẻ {analysis['reverse_pct']}%"
-        )
-        if analysis.get("block_reason"):
-            section5 += f"\nCảnh báo: {analysis['block_reason']}"
-        if analysis["flipped"]:
-            section5 += f"\nĐã bẻ: {analysis['flip_reason']}"
-    else:
-        section5 = "Dự đoán mới: Không dự đoán"
-
-    return (
-        f"Đã lưu kết quả: +{inserted_count} | Tổng đã lưu: {total_saved}\n"
-        f"{section2}\n"
-        f"{section3}\n"
-        f"{section4}\n"
-        f"{section5}"
-    )
+def predict_from_hex(hex_text):
+    cleaned = hex_text.strip().lower()
+    total = sum(int(ch, 16) for ch in cleaned)
+    score = (total % 16) + 3  # 3..18
+    label = "TÀI" if score >= 11 else "XỈU"
+    return cleaned, total, score, label
 
 
-def build_import_reply(
-    inserted_count: int,
-    total_saved: int,
-    analysis: Dict[str, Any],
-) -> str:
-    section2 = f"Đã lưu kết quả: +{inserted_count} | Tổng đã lưu: {total_saved}"
-    section3 = f"Cầu: {analysis['pattern_label']}" if analysis["recognized"] else "Cầu: Không nhận diện được cầu"
-
-    if analysis["recognized"] and analysis["prediction"] in {"T", "X"}:
-        final_txt = fmt_outcome(analysis["prediction"])
-        section4 = (
-            f"Dự đoán mới: {final_txt} | Độ tin cậy: {analysis['confidence']}%\n"
-            f"Tỷ lệ: Theo {analysis['follow_pct']}% | Bẻ {analysis['reverse_pct']}%"
-        )
-        if analysis.get("block_reason"):
-            section4 += f"\nCảnh báo: {analysis['block_reason']}"
-        if analysis["flipped"]:
-            section4 += f"\nĐã bẻ: {analysis['flip_reason']}"
-    else:
-        section4 = "Dự đoán mới: Không dự đoán"
-
-    return f"{section2}\n{section3}\n{section4}"
+def parse_result_text(text):
+    m = RESULT_RE.fullmatch(text.strip())
+    if not m:
+        return None
+    a, b, c = map(int, m.groups())
+    total = a + b + c
+    label = "TÀI" if total >= 11 else "XỈU"
+    return (a, b, c), total, label
 
 
-def build_matrix_reply(analysis: Dict[str, Any]) -> str:
-    signal_count = analysis.get("matrix_signal_count", 0)
-    family_count = analysis.get("matrix_family_count", 0)
-    consensus = analysis.get("matrix_consensus", 0)
-
-    markov_pred = analysis.get("markov_pred")
-    markov_text = fmt_outcome(markov_pred) if markov_pred in {"T", "X"} else "N/A"
-    entropy = binary_entropy(load_history(80), 40)
-    risk_line = f"Rủi ro: {analysis.get('risk_tag', '')}" if analysis.get("risk_tag") else ""
-
-    if analysis["recognized"] and analysis["prediction"] in {"T", "X"}:
-        out = [
-            f"Ma trận tổng hợp: {fmt_outcome(analysis['prediction'])}",
-            f"Độ tin cậy: {analysis['confidence']}%",
-            f"Đồng thuận: {consensus}% | Tín hiệu: {signal_count} | Nhóm cầu: {family_count}",
-            f"Tổng điểm: T={analysis.get('matrix_score_t', 0)} | X={analysis.get('matrix_score_x', 0)} | Tổng={analysis.get('matrix_total', 0)}",
-            f"Độ gãy cầu: {analysis.get('break_score', 0)}/100 ({analysis.get('break_desc', 'N/A')})",
-            f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})",
-            f"Markov-2: {markov_text} | P={analysis.get('markov_prob', 0.0):.2f} | support={analysis.get('markov_support', 0)}",
-            f"Entropy: {entropy:.2f}",
-            risk_line,
-            analysis.get("matrix_text", "Ma trận: Không có tín hiệu đủ mạnh"),
-            analysis.get("zigzag_text", "Bảng cầu zigzag: Chưa có dữ liệu"),
-        ]
-        if analysis.get("blocked"):
-            out.append(f"Chặn nhiễu: {analysis.get('block_reason', '')}")
-        return "\n".join([x for x in out if x])
-
-    out = [
-        "Ma trận tổng hợp: Không dự đoán",
-        f"Đồng thuận: {consensus}% | Tín hiệu: {signal_count} | Nhóm cầu: {family_count}",
-        f"Độ gãy cầu: {analysis.get('break_score', 0)}/100 ({analysis.get('break_desc', 'N/A')})",
-        f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})",
-        f"Markov-2: {markov_text} | P={analysis.get('markov_prob', 0.0):.2f} | support={analysis.get('markov_support', 0)}",
-        f"Entropy: {entropy:.2f}",
-        risk_line,
-        analysis.get("matrix_text", "Ma trận: Không có tín hiệu đủ mạnh"),
-        analysis.get("zigzag_text", "Bảng cầu zigzag: Chưa có dữ liệu"),
-    ]
-    if analysis.get("blocked"):
-        out.append(f"Chặn nhiễu: {analysis.get('block_reason', '')}")
-    return "\n".join([x for x in out if x])
+def win_rate(wins: int, losses: int) -> int:
+    total = wins + losses
+    if total <= 0:
+        return 0
+    return int((wins / total) * 100)
 
 
-def save_current_prediction_if_any(seq: List[str]) -> None:
-    current_count = len(seq)
-    if current_count < MIN_PREDICT_HISTORY:
-        return
-    if has_pending_prediction_for_count(current_count):
-        return
+def prediction_flow(hex_text):
+    with lock:
+        ch = ensure_group_state()
+        if ch["busy"]:
+            send_message("🕗 Đang xử lý phiên trước...")
+            return
+        ch["busy"] = True
+        save_state(state)
 
-    analysis = classify_pattern_pro(seq)
-    if analysis["recognized"] and analysis["prediction"] in {"T", "X"}:
-        save_prediction(
-            pattern=analysis["pattern_label"],
-            predicted_outcome=analysis["prediction"],
-            confidence=analysis["confidence"],
-            based_on_count=current_count,
-        )
-
-
-def vip_loading_frames() -> List[str]:
-    return [
-        "🔍 Đang quét dữ liệu...\nTiến độ: 20%",
-        "📊 Phân tích cầu...\nTiến độ: 40%",
-        "🧠 AI đang tính toán...\nTiến độ: 60%",
-        "📈 Đánh giá độ tin cậy...\nTiến độ: 80%",
-        "✅ Hoàn tất phân tích...\nTiến độ: 100%",
-    ]
-
-
-async def vip_show_loading_then_reply(update: Update, reply: str):
-    if not update.message:
-        return
     try:
-        await update.message.reply_text(reply)
-    except Exception:
-        pass
+        cleaned, total, score, label = predict_from_hex(hex_text)
+
+        with lock:
+            ch = ensure_group_state()
+            ch["last_input"] = cleaned
+            ch["last_prediction"] = label
+            ch["last_score"] = score
+            ch["last_result"] = None
+            save_state(state)
+
+        wins = ensure_group_state()["wins"]
+        losses = ensure_group_state()["losses"]
+
+        # Gửi từng dòng riêng biệt
+        send_message("🔍 Lấy Kết Quả Từ Hệ Thống...")
+        send_message("🌐 Nguồn: https://www.luckywin882.com/")
+        time.sleep(1)
+
+        send_message("📡 Đang kết nối hệ thống...")
+        time.sleep(1)
+
+        send_message("🔄 Đang xử lý dữ liệu...")
+        time.sleep(1)
+
+        send_message(f"🏆 Phiên vừa xong: {label} - {score} ✅")
+        send_message(f"🔸 Tổng thắng: {wins}")
+        send_message(f"🔸 Tổng thua: {losses}")
+
+        send_message("🧠 Đang phân tích cầu...")
+        send_message("📊 Đang tính toán xác suất...")
+
+        send_message("🤖 Bot Đang Phân Tích Giải Mã Chuỗi MD5 🤖")
+        send_message(f"• Mã MD5: [{cleaned}]")
+
+        time.sleep(5)
+
+        ch = ensure_group_state()
+        rate = win_rate(ch["wins"], ch["losses"])
+
+        send_message(f"📣 Mọi người! Hãy chọn : {label}")
+        send_message(f"🔍 Tỉ lệ thắng : {rate}%")
+        send_message("🕗 Chờ kết quả...")
+
+    finally:
+        with lock:
+            ch = ensure_group_state()
+            ch["busy"] = False
+            save_state(state)
 
 
-# =========================
-# TELEGRAM HANDLERS
-# =========================
-WELCOME = (
-    "Bot thống kê Tài/Xỉu đã sẵn sàng.\n\n"
-    "Lệnh dùng:\n"
-    "/add <dữ liệu>          - thêm 1 hoặc nhiều kết quả (live)\n"
-    "/import <dữ liệu>       - dán lịch sử dài (chỉ lưu)\n"
-    "/history [n]            - xem n kết quả gần nhất\n"
-    "/stats [n]              - thống kê tần suất\n"
-    "/scan [n]               - phân tích lịch sử\n"
-    "/brain [n]              - xem bộ nhớ não\n"
-    "/matrix [n]             - xem ma trận tổng hợp\n"
-    "/backtest [n]           - backtest độ đúng\n"
-    "/clear, /reset_history  - xóa lịch sử + kèo chờ, giữ não\n"
-    "/reset_all              - xóa toàn bộ, gồm cả não\n\n"
-    "Chỉ ADMIN mới dùng được."
-)
+def check_admin_result(text):
+    parsed = parse_result_text(text)
+    if not parsed:
+        return False
+
+    nums, total, actual_label = parsed
+
+    with lock:
+        ch = ensure_group_state()
+        predicted = ch["last_prediction"]
+
+        if not predicted:
+            send_message("⚠️ Chưa có dự đoán trước đó để kiểm tra.")
+            return True
+
+        ch["last_result"] = actual_label
+
+        if actual_label == predicted:
+            ch["wins"] += 1
+            status = "✅ DỰ ĐOÁN ĐÚNG"
+        else:
+            ch["losses"] += 1
+            status = "❌ DỰ ĐOÁN SAI"
+
+        save_state(state)
+
+        wins = ch["wins"]
+        losses = ch["losses"]
+        rate = win_rate(wins, losses)
+
+    # Gửi từng dòng riêng
+    send_message("🏆 KẾT QUẢ PHIÊN")
+    send_message(f"🎲 Kết quả: {nums[0]}-{nums[1]}-{nums[2]} → {total} ({actual_label})")
+    send_message(f"📊 Dự đoán trước: {predicted}")
+    send_message(f"🎯 {status}")
+    send_message(f"🔸 Tổng thắng: {wins}")
+    send_message(f"🔸 Tổng thua: {losses}")
+    send_message(f"🔍 Tỉ lệ thắng: {rate}%")
+    return True
 
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny_if_not_admin(update)
-    if update.message:
-        await update.message.reply_text(WELCOME)
-
-
-async def process_live_input(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    if not update.message:
+def handle_message(update):
+    message = update.get("message") or update.get("edited_message")
+    if not message:
         return
-    items = extract_outcomes(text)
-    if not items:
-        await update.message.reply_text("Không tìm thấy dữ liệu hợp lệ.")
+
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    if chat_id != GROUP_ID:
         return
 
-    async with DB_IO_LOCK:
-        inserted = save_outcomes(items, text)
-        resolved = resolve_pending_predictions(items)
-        latest_resolution = resolved[-1] if resolved else get_latest_resolution()
-        seq = load_history(200)
-        analysis = classify_pattern_pro(seq)
-        save_current_prediction_if_any(seq)
-        total_saved = count_saved_rounds()
-        wins, losses = get_prediction_stats()
-
-    reply = build_live_reply(
-        inserted_count=inserted,
-        total_saved=total_saved,
-        latest_resolution=latest_resolution,
-        wins=wins,
-        losses=losses,
-        analysis=analysis,
-    )
-    if update.message:
-        await update.message.reply_text(reply)
-
-
-async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny_if_not_admin(update)
-    if not update.message:
-        return
-    text = " ".join(context.args).strip()
+    user = message.get("from", {})
+    user_id = user.get("id", 0)
+    text = (message.get("text") or "").strip()
     if not text:
-        await update.message.reply_text("Dùng: /add T X T 11 8 14")
-        return
-    await process_live_input(update, context, text)
-
-
-async def import_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny_if_not_admin(update)
-    if not update.message:
-        return
-    text = " ".join(context.args).strip()
-    if not text:
-        await update.message.reply_text("Dùng: /import T X X T 11 8 14 6 ...")
         return
 
-    items = extract_outcomes(text)
-    if not items:
-        await update.message.reply_text("Không tìm thấy dữ liệu hợp lệ.")
+    # Chỉ admin mới được điều khiển bot
+    if user_id != ADMIN_ID:
         return
 
-    async with DB_IO_LOCK:
-        inserted = save_outcomes(items, text)
-        seq = load_history(200)
-        analysis = classify_pattern_pro(seq)
-        total_saved = count_saved_rounds()
-
-    reply = build_import_reply(
-        inserted_count=inserted,
-        total_saved=total_saved,
-        analysis=analysis,
-    )
-    await update.message.reply_text(reply)
-
-
-async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny_if_not_admin(update)
-    if not update.message:
+    # Lệnh phụ cho admin
+    if text == "/reset":
+        with lock:
+            state[str(GROUP_ID)] = {
+                "wins": 0,
+                "losses": 0,
+                "busy": False,
+                "last_prediction": None,
+                "last_score": None,
+                "last_input": None,
+                "last_result": None,
+            }
+            save_state(state)
+        send_message("🔄 Đã reset thống kê.")
         return
 
-    n = 20
-    if context.args and context.args[0].isdigit():
-        n = max(1, min(200, int(context.args[0])))
-
-    rows = load_rows(n)
-    if not rows:
-        await update.message.reply_text("Chưa có lịch sử.")
+    if text == "/stats":
+        ch = ensure_group_state()
+        rate = win_rate(ch["wins"], ch["losses"])
+        send_message(f"🔸 Tổng thắng: {ch['wins']}")
+        send_message(f"🔸 Tổng thua: {ch['losses']}")
+        send_message(f"🔍 Tỉ lệ thắng: {rate}%")
         return
 
-    lines = ["Lịch sử gần nhất:"]
-    for r in rows:
-        lines.append(f"#{r['id']} | {r['outcome']} | {r['created_at']}")
-    await update.message.reply_text("\n".join(lines))
-
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny_if_not_admin(update)
-    if not update.message:
+    # Admin nhập kết quả thật: 6-5-4
+    if check_admin_result(text):
         return
 
-    n = 200
-    if context.args and context.args[0].isdigit():
-        n = max(1, min(2000, int(context.args[0])))
-
-    seq = load_history(n)
-    if not seq:
-        await update.message.reply_text("Chưa có dữ liệu.")
+    # Admin nhập chuỗi MD5 để bot phân tích
+    if is_hex_input(text):
+        t = threading.Thread(target=prediction_flow, args=(text,), daemon=True)
+        t.start()
         return
-
-    count = Counter(seq)
-    total = len(seq)
-    msg = (
-        f"Thống kê {total} mẫu gần nhất:\n"
-        f"- Tài: {count['T']} ({count['T'] / total * 100:.1f}%)\n"
-        f"- Xỉu: {count['X']} ({count['X'] / total * 100:.1f}%)"
-    )
-    await update.message.reply_text(msg)
-
-
-async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny_if_not_admin(update)
-    if not update.message:
-        return
-
-    n = 200
-    if context.args and context.args[0].isdigit():
-        n = max(1, min(2000, int(context.args[0])))
-
-    seq = load_history(n)
-    if not seq:
-        await update.message.reply_text("Chưa có dữ liệu để quét.")
-        return
-
-    analysis = classify_pattern_pro(seq)
-    if analysis["recognized"] and analysis["prediction"] in {"T", "X"} and len(seq) >= MIN_PREDICT_HISTORY:
-        msg = (
-            f"Cầu: {analysis['pattern_label']}\n"
-            f"Vào: {fmt_outcome(analysis['prediction'])} | Độ tin cậy: {analysis['confidence']}%"
-        )
-        if analysis.get("block_reason"):
-            msg += f"\nCảnh báo: {analysis['block_reason']}"
-        if analysis["flipped"]:
-            msg += f"\nĐã bẻ: {analysis['flip_reason']}"
-    elif analysis["recognized"]:
-        msg = (
-            f"Cầu: {analysis['pattern_label']}\n"
-            f"Vào: Không dự đoán"
-        )
-    else:
-        msg = "Cầu: Không nhận diện được cầu"
-
-    await update.message.reply_text(msg)
-
-
-async def patterns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny_if_not_admin(update)
-    if not update.message:
-        return
-    await update.message.reply_text("Chức năng bảng cầu đã được ẩn.")
-
-
-async def matrix_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny_if_not_admin(update)
-    if not update.message:
-        return
-
-    n = 200
-    if context.args and context.args[0].isdigit():
-        n = max(1, min(2000, int(context.args[0])))
-
-    seq = load_history(n)
-    if not seq:
-        await update.message.reply_text("Chưa có dữ liệu.")
-        return
-
-    analysis = classify_pattern_pro(seq)
-    await update.message.reply_text(build_matrix_reply(analysis))
-
-
-async def brain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny_if_not_admin(update)
-    if not update.message:
-        return
-
-    n = 10
-    if context.args and context.args[0].isdigit():
-        n = max(1, min(50, int(context.args[0])))
-
-    rows = get_brain_rows(n)
-    if not rows:
-        await update.message.reply_text("Não chưa có dữ liệu.")
-        return
-
-    lines = [
-        f"Bộ nhớ não: {count_brain_patterns()} pattern",
-        "Top pattern:",
-    ]
-    for r in rows:
-        total = int(r["wins"]) + int(r["losses"])
-        win_rate = (int(r["wins"]) / total * 100) if total else 0.0
-        lines.append(
-            f"- {r['pattern_key']} | W:{r['wins']} L:{r['losses']} "
-            f"| LoseStreak:{r['recent_losses']} | Winrate:{win_rate:.1f}%"
-        )
-
-    await update.message.reply_text("\n".join(lines))
-
-
-async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny_if_not_admin(update)
-    if not update.message:
-        return
-
-    n = 300
-    if context.args and context.args[0].isdigit():
-        n = max(50, min(2000, int(context.args[0])))
-
-    seq = load_history(n)
-    if len(seq) < 30:
-        await update.message.reply_text("Chưa đủ dữ liệu để backtest.")
-        return
-
-    hits = 0
-    total = 0
-    for i in range(20, len(seq) - 1):
-        hist = seq[:i]
-        real = seq[i]
-        analysis = classify_pattern_pro(hist)
-        if analysis["recognized"] and analysis["prediction"] in {"T", "X"}:
-            total += 1
-            if analysis["prediction"] == real:
-                hits += 1
-
-    acc = (hits / total * 100) if total else 0.0
-    await update.message.reply_text(
-        f"Backtest {len(seq)} mẫu gần nhất:\n"
-        f"- Kèo hợp lệ: {total}\n"
-        f"- Đúng: {hits}\n"
-        f"- Accuracy: {acc:.1f}%"
-    )
-
-
-async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny_if_not_admin(update)
-    if not update.message:
-        return
-    async with DB_IO_LOCK:
-        reset_history_only()
-    await update.message.reply_text("Đã xóa toàn bộ lịch sử và kèo chờ. Não vẫn được giữ lại.")
-
-
-async def reset_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny_if_not_admin(update)
-    if not update.message:
-        return
-    async with DB_IO_LOCK:
-        reset_history_only()
-    await update.message.reply_text("Đã reset lịch sử. Não vẫn được giữ lại.")
-
-
-async def reset_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return await deny_if_not_admin(update)
-    if not update.message:
-        return
-    async with DB_IO_LOCK:
-        reset_all()
-    await update.message.reply_text("Đã xóa toàn bộ: lịch sử, kèo chờ và não.")
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-    if not update.message:
-        return
-    text = update.message.text or ""
-    await process_live_input(update, context, text)
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled exception while processing update: %s", context.error)
 
 
 def main():
-    if not TOKEN:
-        raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN trong biến môi trường.")
-    if not ADMIN_USER_ID:
-        raise RuntimeError("Thiếu ADMIN_USER_ID trong biến môi trường hoặc giá trị không hợp lệ.")
-    if not TELEGRAM_AVAILABLE:
-        raise RuntimeError("Thiếu thư viện python-telegram-bot. Cài bằng: pip install python-telegram-bot -U")
+    offset = 0
+    ensure_group_state()
+    save_state(state)
+    print("Bot đang chạy...")
 
-    init_db()
-    app = Application.builder().token(TOKEN).build()
+    while True:
+        try:
+            r = requests.get(
+                f"{API}/getUpdates",
+                params={"offset": offset, "timeout": 30},
+                timeout=40,
+            )
+            r.raise_for_status()
+            data = r.json()
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", start_cmd))
-    app.add_handler(CommandHandler("add", add_cmd))
-    app.add_handler(CommandHandler("import", import_cmd))
-    app.add_handler(CommandHandler("history", history_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CommandHandler("scan", scan_cmd))
-    app.add_handler(CommandHandler("patterns", patterns_cmd))
-    app.add_handler(CommandHandler("matrix", matrix_cmd))
-    app.add_handler(CommandHandler("brain", brain_cmd))
-    app.add_handler(CommandHandler("backtest", backtest_cmd))
-    app.add_handler(CommandHandler("clear", clear_cmd))
-    app.add_handler(CommandHandler("reset_history", reset_history_cmd))
-    app.add_handler(CommandHandler("reset_all", reset_all_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-    app.add_error_handler(error_handler)
+            if not data.get("ok"):
+                time.sleep(1)
+                continue
 
-    logger.info("Bot đang chạy...")
-    app.run_polling()
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1
+                handle_message(update)
+
+        except Exception as e:
+            print("Lỗi:", e)
+            time.sleep(2)
 
 
 if __name__ == "__main__":
