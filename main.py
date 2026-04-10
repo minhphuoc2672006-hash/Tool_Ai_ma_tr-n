@@ -6,25 +6,43 @@ Telegram bot Tài/Xỉu theo lịch sử, có 2 lớp:
 - History: lịch sử nhập vào, có thể reset riêng
 - Brain: bộ nhớ pattern win/lose, giữ lại khi reset history
 
-Bản nâng cấp:
-- Ma trận tổng hợp nhiều tín hiệu pattern thay vì chỉ lấy 1 pattern đầu tiên
+Nâng cấp:
+- Ma trận tổng hợp nhiều tín hiệu pattern
 - Bảng cầu zigzag
 - Điểm độ gãy cầu
-- Chặn nhiễu tự động
-
-Lưu ý: đây là bot thống kê / phân tích pattern, không thể đảm bảo kết quả.
+- Chặn nhiễu mềm: vẫn dự đoán bình thường, chỉ giảm confidence khi nhiễu cao
+- Markov-2 + entropy + backtest
 """
+
+from __future__ import annotations
 
 import os
 import re
 import sqlite3
 import logging
 import asyncio
+import math
 from collections import Counter
 from typing import List, Optional, Tuple, Dict, Any
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+try:
+    from telegram import Update
+    from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+    TELEGRAM_AVAILABLE = True
+except ModuleNotFoundError:
+    TELEGRAM_AVAILABLE = False
+    from typing import Any as Update  # type: ignore
+    from types import SimpleNamespace
+
+    class _TelegramUnavailable:
+        def __getattr__(self, name):
+            return SimpleNamespace(DEFAULT_TYPE=Any) if name == "DEFAULT_TYPE" else self
+
+        def __call__(self, *args, **kwargs):
+            return self
+
+    Application = CommandHandler = MessageHandler = filters = _TelegramUnavailable()
+    ContextTypes = SimpleNamespace(DEFAULT_TYPE=Any)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 DB_PATH = os.getenv("TAI_XIU_DB_PATH", "tai_xiu_stats.db")
@@ -61,6 +79,7 @@ MATRIX_SOURCE_BONUS = {
     "MIXED": 0.92,
     "WEIGHTED_TREND": 0.88,
     "MICRO_PRESSURE": 0.90,
+    "MARKOV": 1.20,
 }
 
 MATRIX_FAMILY_BONUS = {
@@ -83,9 +102,12 @@ MATRIX_FAMILY_BONUS = {
     "CHUYEN_CAU": 1.04,
     "XU_HUONG_GAN": 0.98,
     "XU_HUONG_NEN": 0.94,
+    "MARKOV": 1.10,
     "MATRIX": 1.00,
     "OTHER": 0.90,
 }
+
+PREDICTION_NEVER_BLOCK = True
 
 # =========================
 # ADMIN CHECK
@@ -280,6 +302,8 @@ def pattern_family(label: str) -> str:
         return "XU_HUONG_NEN"
     if t.startswith("Ma trận"):
         return "MATRIX"
+    if t.startswith("Cầu Markov"):
+        return "MARKOV"
     return "OTHER"
 
 
@@ -665,55 +689,48 @@ def weighted_trend(seq: List[str], window: int = 20) -> Tuple[Optional[str], int
     return trend, abs(score)
 
 
-def adjust_prediction_by_memory(pattern_label: str, predicted_outcome: Optional[str], confidence: int) -> Tuple[Optional[str], int, bool, str]:
-    """Điều chỉnh dự đoán theo brain, luôn trả về đúng 4 giá trị."""
-    try:
-        if not pattern_label or predicted_outcome not in {"T", "X"}:
-            return predicted_outcome, confidence, False, "NO_MEMORY"
+def binary_entropy(seq: List[str], window: int = 40) -> float:
+    """
+    Entropy nhị phân chuẩn hóa 0..1.
+    Gần 1 = rất nhiễu, gần 0 = ít biến động.
+    """
+    tail = seq[-window:]
+    if len(tail) < 2:
+        return 0.0
 
-        key = pattern_family(pattern_label)
-        mem = get_pattern_memory(key)
-        if not mem:
-            return predicted_outcome, confidence, False, "NO_MEMORY"
+    c = Counter(tail)
+    total = len(tail)
+    ent = 0.0
+    for key in ("T", "X"):
+        p = c[key] / total
+        if p > 0:
+            ent -= p * math.log2(p)
+    return ent
 
-        wins = int(mem["wins"])
-        losses = int(mem["losses"])
-        recent_losses = int(mem["recent_losses"])
-        total = wins + losses
 
-        if total <= 0:
-            return predicted_outcome, confidence, False, "NO_MEMORY"
+def markov_predict(seq: List[str], order: int = 2, window: int = 120) -> Tuple[Optional[str], float, int]:
+    """
+    Dự đoán theo Markov n-gram.
+    """
+    tail = seq[-window:]
+    if len(tail) < order + 8:
+        return None, 0.0, 0
 
-        win_rate = wins / total
-        flip = False
-        reason = "FOLLOW"
+    suffix = tuple(tail[-order:])
+    counts = Counter()
 
-        if total >= 5 and win_rate < 0.30:
-            flip = True
-            reason = "LOW_WINRATE"
-        elif recent_losses >= 3:
-            flip = True
-            reason = "RECENT_LOSS"
+    for i in range(len(tail) - order):
+        if tuple(tail[i:i + order]) == suffix:
+            nxt = tail[i + order]
+            counts[nxt] += 1
 
-        adjusted_conf = int(confidence)
-        if total >= 10:
-            if win_rate >= 0.60:
-                adjusted_conf += 5
-            elif win_rate <= 0.40:
-                adjusted_conf -= 8
-            else:
-                adjusted_conf -= 4
+    support = counts["T"] + counts["X"]
+    if support <= 0:
+        return None, 0.0, 0
 
-        if flip and predicted_outcome in {"T", "X"}:
-            predicted_outcome = reverse_outcome(predicted_outcome)
-            adjusted_conf -= 5
-
-        adjusted_conf = clamp(adjusted_conf, 0, 100)
-        return predicted_outcome, adjusted_conf, flip, reason
-
-    except Exception as e:
-        logger.exception("Lỗi adjust_prediction_by_memory: %s", e)
-        return predicted_outcome, confidence, False, "ERROR"
+    pred = "T" if counts["T"] >= counts["X"] else "X"
+    prob = (max(counts["T"], counts["X"]) + 1) / (support + 2)
+    return pred, prob, support
 
 
 def detect_noise_score(seq: List[str], segments: List[Tuple[str, int]]) -> Tuple[int, str]:
@@ -728,18 +745,20 @@ def detect_noise_score(seq: List[str], segments: List[Tuple[str, int]]) -> Tuple
     short_ratio = short_runs / max(1, len(segments))
     longest = max((ln for _, ln in segments), default=1)
     balance_gap = abs(seq.count("T") - seq.count("X")) / max(1, len(seq))
+    ent = binary_entropy(seq, window=min(40, len(seq)))
 
     score = int(
-        change_rate * 38
-        + singleton_ratio * 32
-        + short_ratio * 18
-        + (1 - min(longest, 10) / 10) * 12
-        - balance_gap * 8
+        ent * 34
+        + change_rate * 30
+        + singleton_ratio * 18
+        + short_ratio * 10
+        + (1 - min(longest, 10) / 10) * 10
+        + balance_gap * 8
     )
     score = clamp(score, 0, 100)
 
     if score >= 75:
-        reason = "Nhiễu cao, chuỗi đảo liên tục"
+        reason = "Nhiễu rất cao"
     elif score >= 60:
         reason = "Nhiễu trung bình"
     else:
@@ -900,7 +919,7 @@ def make_signal(label: str, predicted_outcome: Optional[str], confidence: int, s
     }
 
 
-def matrix_vote(signals: List[Dict[str, Any]]) -> Tuple[Optional[str], int, int, int, int]:
+def smart_final_vote(signals: List[Dict[str, Any]]) -> Tuple[Optional[str], int, int, int, int]:
     if not signals:
         return None, 0, 0, 0, 0
 
@@ -955,6 +974,52 @@ def matrix_vote(signals: List[Dict[str, Any]]) -> Tuple[Optional[str], int, int,
     return pred, confidence, score_t, score_x, total
 
 
+def adjust_prediction_by_memory(pattern_label: str, predicted_outcome: Optional[str], confidence: int) -> Tuple[Optional[str], int, bool, str]:
+    try:
+        if not pattern_label or predicted_outcome not in {"T", "X"}:
+            return predicted_outcome, confidence, False, "NO_MEMORY"
+
+        key = pattern_family(pattern_label)
+        mem = get_pattern_memory(key)
+        if not mem:
+            return predicted_outcome, confidence, False, "NO_MEMORY"
+
+        wins = int(mem["wins"])
+        losses = int(mem["losses"])
+        recent_losses = int(mem["recent_losses"])
+        total = wins + losses
+        if total <= 0:
+            return predicted_outcome, confidence, False, "NO_MEMORY"
+
+        win_rate = (wins + 1) / (total + 2)
+        adjusted_conf = int(confidence)
+
+        if total >= 10:
+            if win_rate >= 0.62:
+                adjusted_conf += 6
+            elif win_rate <= 0.38:
+                adjusted_conf -= 8
+            else:
+                adjusted_conf -= 3
+
+        flip = False
+        reason = "FOLLOW"
+        if total >= 8 and recent_losses >= 4 and win_rate < 0.45:
+            flip = True
+            reason = "RECENT_LOSS_STRONG"
+
+        if flip:
+            predicted_outcome = reverse_outcome(predicted_outcome)
+            adjusted_conf -= 4
+
+        adjusted_conf = clamp(adjusted_conf, 0, 100)
+        return predicted_outcome, adjusted_conf, flip, reason
+
+    except Exception as e:
+        logger.exception("Lỗi adjust_prediction_by_memory: %s", e)
+        return predicted_outcome, confidence, False, "ERROR"
+
+
 def build_signal_bundle(seq: List[str]) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "pattern_label": "Không nhận diện được cầu",
@@ -981,6 +1046,10 @@ def build_signal_bundle(seq: List[str]) -> Dict[str, Any]:
         "matrix_signal_count": 0,
         "matrix_family_count": 0,
         "matrix_consensus": 0,
+        "markov_pred": None,
+        "markov_prob": 0.0,
+        "markov_support": 0,
+        "risk_tag": "",
     }
 
     if len(seq) < 5:
@@ -1148,92 +1217,87 @@ def build_signal_bundle(seq: List[str]) -> Dict[str, Any]:
         if sig:
             signals.append(sig)
 
+    markov_pred, markov_prob, markov_support = markov_predict(window, order=2, window=120)
+    if markov_pred and markov_prob >= 0.58:
+        sig = make_signal(
+            f"Cầu Markov {fmt_outcome(markov_pred)}",
+            markov_pred,
+            int(round(markov_prob * 100)),
+            "MARKOV",
+            max(1, markov_support),
+        )
+        if sig:
+            signals.append(sig)
+
     noise_score, noise_desc = detect_noise_score(window, segments)
     break_score, break_desc = detect_break_score(window, segments)
     zigzag_text = build_zigzag_table(window)
 
-    pred, conf, score_t, score_x, total = matrix_vote(signals)
+    pred, conf, score_t, score_x, total = smart_final_vote(signals)
     matrix_text = build_matrix_preview(signals)
 
     signal_count = len(signals)
     family_count = len({s["family"] for s in signals}) if signals else 0
     consensus = int(round((max(score_t, score_x) / total) * 100)) if total > 0 else 0
 
-    recognized = bool(signals)
+    conf = clamp(
+        int(round(
+            conf
+            - (12 if noise_score >= 80 else 8 if noise_score >= 65 else 3 if noise_score >= 50 else 0)
+            + (6 if consensus >= 75 else 0)
+            - (6 if consensus <= 55 else 0)
+            + (int((markov_prob - 0.5) * 20) if markov_support >= 4 else 0)
+        )),
+        0,
+        100,
+    )
+
+    recognized = bool(signals) and pred in {"T", "X"}
     blocked = False
     block_reason = ""
 
-    if pred not in {"T", "X"}:
-        recognized = False
-
+    # Không hard-stop: chỉ gắn cảnh báo, vẫn ra kèo
     if recognized and total > 0:
-        best_conf = max((int(s["confidence"]) for s in signals), default=0)
+        if noise_score >= 80:
+            block_reason = "Nhiễu rất cao, đã giảm độ tin cậy"
+        elif noise_score >= 65:
+            block_reason = "Nhiễu trung bình/cao, đã giảm độ tin cậy"
 
-        if noise_score >= 75 and best_conf < 88:
-            blocked = True
-            block_reason = "Nhiễu cao, chặn dự đoán"
-            pred = None
-            conf = 0
-            recognized = False
-        elif noise_score >= 65 and conf < 68:
-            blocked = True
-            block_reason = "Nhiễu trung bình, độ mạnh chưa đủ"
-            pred = None
-            conf = 0
-            recognized = False
+    result.update(
+        {
+            "pattern_label": signals[0]["pattern_label"] if signals else "Không nhận diện được cầu",
+            "prediction": pred,
+            "confidence": conf,
+            "recognized": recognized,
+            "flipped": False,
+            "flip_reason": "",
+            "follow_pct": conf if recognized else 0,
+            "reverse_pct": max(0, min(100, 100 - conf)) if recognized else 0,
+            "source": "MATRIX",
+            "signals": signals,
+            "matrix_text": matrix_text,
+            "zigzag_text": zigzag_text,
+            "break_score": break_score,
+            "break_desc": break_desc,
+            "noise_score": noise_score,
+            "noise_desc": noise_desc,
+            "blocked": blocked,
+            "block_reason": block_reason,
+            "matrix_score_t": score_t,
+            "matrix_score_x": score_x,
+            "matrix_total": total,
+            "matrix_signal_count": signal_count,
+            "matrix_family_count": family_count,
+            "matrix_consensus": consensus,
+            "markov_pred": markov_pred,
+            "markov_prob": markov_prob,
+            "markov_support": markov_support,
+            "risk_tag": "NHIỄU_CAO" if noise_score >= 75 else ("NHIỄU_TRUNG_BINH" if noise_score >= 60 else "NHIỄU_THẤP"),
+        }
+    )
 
-    if recognized and pred in {"T", "X"}:
-        result.update(
-            {
-                "pattern_label": signals[0]["pattern_label"],
-                "prediction": pred,
-                "confidence": conf,
-                "recognized": True,
-                "flipped": False,
-                "flip_reason": "",
-                "follow_pct": conf,
-                "reverse_pct": max(0, min(100, 100 - conf)),
-                "source": "MATRIX",
-                "signals": signals,
-                "matrix_text": matrix_text,
-                "zigzag_text": zigzag_text,
-                "break_score": break_score,
-                "break_desc": break_desc,
-                "noise_score": noise_score,
-                "noise_desc": noise_desc,
-                "blocked": blocked,
-                "block_reason": block_reason,
-                "matrix_score_t": score_t,
-                "matrix_score_x": score_x,
-                "matrix_total": total,
-                "matrix_signal_count": signal_count,
-                "matrix_family_count": family_count,
-                "matrix_consensus": consensus,
-            }
-        )
-    else:
-        result.update(
-            {
-                "signals": signals,
-                "matrix_text": matrix_text,
-                "zigzag_text": zigzag_text,
-                "break_score": break_score,
-                "break_desc": break_desc,
-                "noise_score": noise_score,
-                "noise_desc": noise_desc,
-                "blocked": blocked,
-                "block_reason": block_reason,
-                "matrix_score_t": score_t,
-                "matrix_score_x": score_x,
-                "matrix_total": total,
-                "matrix_signal_count": signal_count,
-                "matrix_family_count": family_count,
-                "matrix_consensus": consensus,
-            }
-        )
-        if signals:
-            result["pattern_label"] = signals[0]["pattern_label"]
-
+    if recognized and pred not in {"T", "X"}:
+        result["recognized"] = False
     return result
 
 
@@ -1273,6 +1337,8 @@ def build_live_reply(
             f"Dự đoán mới: {final_txt} | Độ tin cậy: {analysis['confidence']}%\n"
             f"Tỷ lệ: Theo {analysis['follow_pct']}% | Bẻ {analysis['reverse_pct']}%"
         )
+        if analysis.get("block_reason"):
+            section5 += f"\nCảnh báo: {analysis['block_reason']}"
         if analysis["flipped"]:
             section5 += f"\nĐã bẻ: {analysis['flip_reason']}"
     else:
@@ -1301,6 +1367,8 @@ def build_import_reply(
             f"Dự đoán mới: {final_txt} | Độ tin cậy: {analysis['confidence']}%\n"
             f"Tỷ lệ: Theo {analysis['follow_pct']}% | Bẻ {analysis['reverse_pct']}%"
         )
+        if analysis.get("block_reason"):
+            section4 += f"\nCảnh báo: {analysis['block_reason']}"
         if analysis["flipped"]:
             section4 += f"\nĐã bẻ: {analysis['flip_reason']}"
     else:
@@ -1314,6 +1382,11 @@ def build_matrix_reply(analysis: Dict[str, Any]) -> str:
     family_count = analysis.get("matrix_family_count", 0)
     consensus = analysis.get("matrix_consensus", 0)
 
+    markov_pred = analysis.get("markov_pred")
+    markov_text = fmt_outcome(markov_pred) if markov_pred in {"T", "X"} else "N/A"
+    entropy = binary_entropy(load_history(80), 40)
+    risk_line = f"Rủi ro: {analysis.get('risk_tag', '')}" if analysis.get("risk_tag") else ""
+
     if analysis["recognized"] and analysis["prediction"] in {"T", "X"}:
         out = [
             f"Ma trận tổng hợp: {fmt_outcome(analysis['prediction'])}",
@@ -1322,24 +1395,30 @@ def build_matrix_reply(analysis: Dict[str, Any]) -> str:
             f"Tổng điểm: T={analysis.get('matrix_score_t', 0)} | X={analysis.get('matrix_score_x', 0)} | Tổng={analysis.get('matrix_total', 0)}",
             f"Độ gãy cầu: {analysis.get('break_score', 0)}/100 ({analysis.get('break_desc', 'N/A')})",
             f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})",
+            f"Markov-2: {markov_text} | P={analysis.get('markov_prob', 0.0):.2f} | support={analysis.get('markov_support', 0)}",
+            f"Entropy: {entropy:.2f}",
+            risk_line,
             analysis.get("matrix_text", "Ma trận: Không có tín hiệu đủ mạnh"),
             analysis.get("zigzag_text", "Bảng cầu zigzag: Chưa có dữ liệu"),
         ]
         if analysis.get("blocked"):
             out.append(f"Chặn nhiễu: {analysis.get('block_reason', '')}")
-        return "\n".join(out)
+        return "\n".join([x for x in out if x])
 
     out = [
         "Ma trận tổng hợp: Không dự đoán",
         f"Đồng thuận: {consensus}% | Tín hiệu: {signal_count} | Nhóm cầu: {family_count}",
         f"Độ gãy cầu: {analysis.get('break_score', 0)}/100 ({analysis.get('break_desc', 'N/A')})",
         f"Nhiễu tự động: {analysis.get('noise_score', 0)}/100 ({analysis.get('noise_desc', 'N/A')})",
+        f"Markov-2: {markov_text} | P={analysis.get('markov_prob', 0.0):.2f} | support={analysis.get('markov_support', 0)}",
+        f"Entropy: {entropy:.2f}",
+        risk_line,
         analysis.get("matrix_text", "Ma trận: Không có tín hiệu đủ mạnh"),
         analysis.get("zigzag_text", "Bảng cầu zigzag: Chưa có dữ liệu"),
     ]
     if analysis.get("blocked"):
         out.append(f"Chặn nhiễu: {analysis.get('block_reason', '')}")
-    return "\n".join(out)
+    return "\n".join([x for x in out if x])
 
 
 def save_current_prediction_if_any(seq: List[str]) -> None:
@@ -1350,7 +1429,7 @@ def save_current_prediction_if_any(seq: List[str]) -> None:
         return
 
     analysis = classify_pattern_pro(seq)
-    if analysis["recognized"] and analysis["prediction"] in {"T", "X"} and not analysis.get("blocked"):
+    if analysis["recognized"] and analysis["prediction"] in {"T", "X"}:
         save_prediction(
             pattern=analysis["pattern_label"],
             predicted_outcome=analysis["prediction"],
@@ -1391,6 +1470,7 @@ WELCOME = (
     "/scan [n]               - phân tích lịch sử\n"
     "/brain [n]              - xem bộ nhớ não\n"
     "/matrix [n]             - xem ma trận tổng hợp\n"
+    "/backtest [n]           - backtest độ đúng\n"
     "/clear, /reset_history  - xóa lịch sử + kèo chờ, giữ não\n"
     "/reset_all              - xóa toàn bộ, gồm cả não\n\n"
     "Chỉ ADMIN mới dùng được."
@@ -1542,6 +1622,8 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Cầu: {analysis['pattern_label']}\n"
             f"Vào: {fmt_outcome(analysis['prediction'])} | Độ tin cậy: {analysis['confidence']}%"
         )
+        if analysis.get("block_reason"):
+            msg += f"\nCảnh báo: {analysis['block_reason']}"
         if analysis["flipped"]:
             msg += f"\nĐã bẻ: {analysis['flip_reason']}"
     elif analysis["recognized"]:
@@ -1612,6 +1694,41 @@ async def brain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return await deny_if_not_admin(update)
+    if not update.message:
+        return
+
+    n = 300
+    if context.args and context.args[0].isdigit():
+        n = max(50, min(2000, int(context.args[0])))
+
+    seq = load_history(n)
+    if len(seq) < 30:
+        await update.message.reply_text("Chưa đủ dữ liệu để backtest.")
+        return
+
+    hits = 0
+    total = 0
+    for i in range(20, len(seq) - 1):
+        hist = seq[:i]
+        real = seq[i]
+        analysis = classify_pattern_pro(hist)
+        if analysis["recognized"] and analysis["prediction"] in {"T", "X"}:
+            total += 1
+            if analysis["prediction"] == real:
+                hits += 1
+
+    acc = (hits / total * 100) if total else 0.0
+    await update.message.reply_text(
+        f"Backtest {len(seq)} mẫu gần nhất:\n"
+        f"- Kèo hợp lệ: {total}\n"
+        f"- Đúng: {hits}\n"
+        f"- Accuracy: {acc:.1f}%"
+    )
+
+
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return await deny_if_not_admin(update)
@@ -1660,6 +1777,8 @@ def main():
         raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN trong biến môi trường.")
     if not ADMIN_USER_ID:
         raise RuntimeError("Thiếu ADMIN_USER_ID trong biến môi trường hoặc giá trị không hợp lệ.")
+    if not TELEGRAM_AVAILABLE:
+        raise RuntimeError("Thiếu thư viện python-telegram-bot. Cài bằng: pip install python-telegram-bot -U")
 
     init_db()
     app = Application.builder().token(TOKEN).build()
@@ -1674,6 +1793,7 @@ def main():
     app.add_handler(CommandHandler("patterns", patterns_cmd))
     app.add_handler(CommandHandler("matrix", matrix_cmd))
     app.add_handler(CommandHandler("brain", brain_cmd))
+    app.add_handler(CommandHandler("backtest", backtest_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CommandHandler("reset_history", reset_history_cmd))
     app.add_handler(CommandHandler("reset_all", reset_all_cmd))
