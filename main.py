@@ -29,7 +29,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 DB_PATH = os.getenv("TAI_XIU_DB_PATH", "tai_xiu_stats.db")
 PREDICT_DELAY_SECONDS = 0
-MIN_PREDICT_HISTORY = 15
+MIN_PREDICT_HISTORY = 20
 
 _admin_raw = os.getenv("ADMIN_USER_ID", "").strip()
 try:
