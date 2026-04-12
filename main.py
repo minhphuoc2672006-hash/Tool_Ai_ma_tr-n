@@ -2,9 +2,11 @@
 # -*- coding: utf-8 -*-
 
 import asyncio
+import html
 import os
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -32,7 +34,12 @@ def load_env() -> None:
 load_env()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip() or 0)
+ADMIN_ID_RAW = os.getenv("ADMIN_ID", "0").strip()
+
+try:
+    ADMIN_ID = int(ADMIN_ID_RAW or "0")
+except ValueError as exc:
+    raise RuntimeError("ADMIN_ID trong .env phải là số nguyên") from exc
 
 if not BOT_TOKEN:
     raise RuntimeError("Thiếu BOT_TOKEN trong file .env")
@@ -66,8 +73,8 @@ def normalize_text(text: str) -> str:
 
 def parse_result_label(text: str) -> Optional[str]:
     """
-    Nhận feedback chỉ khi nội dung thực sự là TÀI/XỈU.
-    Tránh nhận nhầm các câu có chứa chữ giống như "HIEN TAI".
+    Chỉ nhận feedback thật sự là TÀI / XỈU.
+    Không bắt nhầm các câu như "HIEN TAI".
     """
     t = normalize_text(text)
     t = re.sub(r"\s+", " ", t)
@@ -81,13 +88,66 @@ def parse_result_label(text: str) -> Optional[str]:
     if tokens in (["X"], ["XIU"]):
         return "XỈU"
 
-    # Chấp nhận dạng "KET QUA TAI" / "RESULT XIU"
-    if "TAI" in tokens and "XIU" not in tokens:
-        return "TÀI"
-    if "XIU" in tokens and "TAI" not in tokens:
-        return "XỈU"
+    if len(tokens) <= 3 and tokens[0] in {"KET", "RESULT", "DAPAN", "DAP", "PHANHOI", "KQ"}:
+        if tokens[-1] == "TAI" and "XIU" not in tokens:
+            return "TÀI"
+        if tokens[-1] == "XIU" and "TAI" not in tokens:
+            return "XỈU"
 
     return None
+
+
+# =========================
+# DISPLAY HELPERS
+# =========================
+def esc(text: str) -> str:
+    return html.escape(str(text))
+
+
+def format_prediction_message(result: str, confidence: int, score: int, h: str) -> str:
+    short_hash = h[:18] + ("..." if len(h) > 18 else "")
+    return (
+        f"🧠 <b>AI PREDICTION</b>\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📥 <b>Hash:</b> <code>{esc(short_hash)}</code>\n"
+        f"🎯 <b>Kết quả:</b> <b>{esc(result)}</b>\n"
+        f"📊 <b>Độ tin cậy:</b> <b>{confidence}%</b>\n"
+        f"⚡ <b>Score:</b> <b>{score}</b>\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🔄 Gửi <b>TÀI</b> hoặc <b>XỈU</b> để bot học."
+    )
+
+
+def format_feedback_message(actual: str, final_pred: str, confidence: int, model_correct: int, model_total: int) -> str:
+    return (
+        f"✅ <b>PHẢN HỒI ĐÃ GHI NHẬN</b>\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🧾 <b>Kết quả thật:</b> <b>{esc(actual)}</b>\n"
+        f"🤖 <b>Bot đã đoán:</b> <b>{esc(final_pred)}</b>\n"
+        f"📊 <b>Độ tin cậy:</b> <b>{confidence}%</b>\n"
+        f"📈 <b>Mô hình đúng:</b> <b>{model_correct}/{model_total}</b>\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🧠 Bot đã tự cập nhật."
+    )
+
+
+def format_status_message(text: str) -> str:
+    return (
+        f"📡 <b>TRẠNG THÁI BOT</b>\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"<pre>{esc(text)}</pre>"
+    )
+
+
+def format_start_message() -> str:
+    return (
+        f"🚀 <b>BOT TÀI/XỈU</b>\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"• Gửi hash hex để phân tích\n"
+        f"• Gửi <b>TÀI</b> hoặc <b>XỈU</b> để feedback\n"
+        f"• /status xem trạng thái\n"
+        f"• /reset để xóa sạch bộ nhớ\n"
+    )
 
 
 # =========================
@@ -119,6 +179,15 @@ def slice_hex(h: str) -> Tuple[str, str, str]:
     return head, mid, tail
 
 
+def hex_chunks(h: str, size: int) -> List[str]:
+    size = max(1, size)
+    return [h[i:i + size] for i in range(0, len(h), size) if h[i:i + size]]
+
+
+def nibble_values(h: str) -> List[int]:
+    return [int(c, 16) for c in h]
+
+
 def weighted_position_value(h: str) -> int:
     n = len(h)
     total = 0
@@ -134,11 +203,10 @@ def weighted_position_value(h: str) -> int:
 def chunk_xor_value(h: str) -> int:
     n = len(h)
     step = max(1, n // 4)
-    parts = [h[i:i + step] for i in range(0, n, step)]
+    parts = hex_chunks(h, step)
     v = 0
     for p in parts:
-        if p:
-            v ^= int(p, 16)
+        v ^= int(p, 16)
     return v
 
 
@@ -157,7 +225,7 @@ def dice3_from_hash(h: str) -> Tuple[int, int, int, int]:
 
 
 # =========================
-# ADAPTIVE BRAIN
+# MODEL CONFIG
 # =========================
 MODS_MAIN = [3, 5, 7, 11, 13, 17, 19, 23, 29]
 PRIME_MODS = [3, 5, 7, 11, 13, 17, 19, 23, 29]
@@ -178,15 +246,32 @@ MODEL_BASE_WEIGHTS: Dict[str, float] = {
     "baseline_sum16": 1.00,
     "full_mod": 1.45,
     "prime_mod": 1.25,
+    "head_mod": 1.10,
+    "mid_mod": 1.10,
+    "tail_mod": 1.10,
     "slice_consensus": 1.30,
     "xor_mix": 1.25,
     "power_mod": 1.15,
     "dice3": 1.20,
     "position_weight": 1.00,
     "rolling_chunk": 1.15,
+    "reverse_parity": 1.05,
+    "bit_count_parity": 1.05,
+    "pair_diff": 1.10,
+    "alternating_sum": 1.05,
+    "chunk_sum": 1.05,
+    "entropy_balance": 1.00,
+    "edge_balance": 1.05,
+    "ascii_mix": 1.00,
+    "mirror_balance": 1.10,
+    "window_mix": 1.05,
+    "zigzag_balance": 1.05,
 }
 
 
+# =========================
+# STATE
+# =========================
 @dataclass
 class PendingCase:
     hash_text: str
@@ -198,8 +283,8 @@ class PendingCase:
 
 @dataclass
 class AdaptiveBrain:
-    model_ewma: Dict[str, float] = field(default_factory=dict)
-    mod_ewma: Dict[int, float] = field(default_factory=dict)
+    model_skill: Dict[str, float] = field(default_factory=dict)
+    mod_skill: Dict[int, float] = field(default_factory=dict)
     pending_case: Optional[PendingCase] = None
 
     prediction_count: int = 0
@@ -213,11 +298,8 @@ class AdaptiveBrain:
         self.reset_all()
 
     def reset_all(self) -> None:
-        """
-        Reset sạch toàn bộ trạng thái, giống như bot mới khởi động.
-        """
-        self.model_ewma = {k: 0.0 for k in MODEL_BASE_WEIGHTS}
-        self.mod_ewma = {k: 0.0 for k in MODS_MAIN}
+        self.model_skill = {k: 0.0 for k in MODEL_BASE_WEIGHTS}
+        self.mod_skill = {k: 0.0 for k in MODS_MAIN}
         self.pending_case = None
 
         self.prediction_count = 0
@@ -229,13 +311,17 @@ class AdaptiveBrain:
 
     def model_weight(self, model_name: str) -> float:
         base = MODEL_BASE_WEIGHTS.get(model_name, 1.0)
-        skill = self.model_ewma.get(model_name, 0.0)
-        return base * clamp(1.0 + (skill * 0.45), 0.55, 1.80)
+        skill = self.model_skill.get(model_name, 0.0)
+        factor = 1.0 + (skill * 0.03)
+        factor = clamp(factor, 0.97, 1.03)
+        return base * factor
 
     def mod_weight(self, m: int) -> float:
         base = BASE_MOD_WEIGHTS.get(m, 1.0)
-        skill = self.mod_ewma.get(m, 0.0)
-        return base * clamp(1.0 + (skill * 0.50), 0.55, 2.20)
+        skill = self.mod_skill.get(m, 0.0)
+        factor = 1.0 + (skill * 0.03)
+        factor = clamp(factor, 0.97, 1.03)
+        return base * factor
 
     def vote_mod(self, v: int, mods: List[int], bias: float = 0.5) -> str:
         tai = 0.0
@@ -248,6 +334,7 @@ class AdaptiveBrain:
                 xiu += w
         return "TÀI" if tai >= xiu else "XỈU"
 
+    # ===== Individual models =====
     def model_01_baseline_sum16(self, h: str) -> str:
         total = sum(int(c, 16) for c in h)
         score = (total % 16) + 3
@@ -257,56 +344,124 @@ class AdaptiveBrain:
         v = hex_to_int(h)
         return self.vote_mod(v, MODS_MAIN, bias=0.50)
 
-    def model_04_prime_mod(self, h: str) -> str:
+    def model_03_prime_mod(self, h: str) -> str:
         v = hex_to_int(h)
         return self.vote_mod(v, PRIME_MODS, bias=0.50)
 
-    def model_05_head_mod(self, h: str) -> str:
+    def model_04_head_mod(self, h: str) -> str:
         head, _, _ = slice_hex(h)
         v = int(head, 16)
         return self.vote_mod(v, MODS_MAIN, bias=0.50)
 
-    def model_06_mid_mod(self, h: str) -> str:
+    def model_05_mid_mod(self, h: str) -> str:
         _, mid, _ = slice_hex(h)
         v = int(mid, 16)
         return self.vote_mod(v, MODS_MAIN, bias=0.50)
 
-    def model_07_tail_mod(self, h: str) -> str:
+    def model_06_tail_mod(self, h: str) -> str:
         _, _, tail = slice_hex(h)
         v = int(tail, 16)
         return self.vote_mod(v, MODS_MAIN, bias=0.50)
 
-    def model_08_slice_consensus(self, h: str) -> str:
+    def model_07_slice_consensus(self, h: str) -> str:
         votes = [
-            self.model_05_head_mod(h),
-            self.model_06_mid_mod(h),
-            self.model_07_tail_mod(h),
+            self.model_04_head_mod(h),
+            self.model_05_mid_mod(h),
+            self.model_06_tail_mod(h),
         ]
         tai = votes.count("TÀI")
         xiu = votes.count("XỈU")
         return "TÀI" if tai >= xiu else "XỈU"
 
-    def model_13_xor_mix(self, h: str) -> str:
+    def model_08_xor_mix(self, h: str) -> str:
         v = hex_to_int(h)
         mixed = v ^ (v >> 7) ^ (v << 11)
         return self.vote_mod(mixed, MODS_MAIN, bias=0.50)
 
-    def model_15_power_mod(self, h: str) -> str:
+    def model_09_power_mod(self, h: str) -> str:
         v = hex_to_int(h)
         mixed = (v * v) ^ (v >> 17) ^ (v << 9)
         return self.vote_mod(mixed, MODS_MAIN, bias=0.50)
 
-    def model_18_dice3(self, h: str) -> str:
+    def model_10_dice3(self, h: str) -> str:
         _, _, _, total = dice3_from_hash(h)
         return "TÀI" if total >= 11 else "XỈU"
 
-    def model_19_position_weight(self, h: str) -> str:
+    def model_11_position_weight(self, h: str) -> str:
         v = weighted_position_value(h)
         return "TÀI" if (v % 16) >= 8 else "XỈU"
 
-    def model_21_rolling_chunk(self, h: str) -> str:
+    def model_12_rolling_chunk(self, h: str) -> str:
         v = chunk_xor_value(h)
         return self.vote_mod(v, MODS_MAIN, bias=0.50)
+
+    def model_13_reverse_parity(self, h: str) -> str:
+        r = h[::-1]
+        v = int(r, 16)
+        return "TÀI" if (v % 16) >= 8 else "XỈU"
+
+    def model_14_bit_count_parity(self, h: str) -> str:
+        bits = bin(int(h, 16))[2:]
+        ones = bits.count("1")
+        return "TÀI" if (ones % 2) == 0 else "XỈU"
+
+    def model_15_pair_diff(self, h: str) -> str:
+        vals = nibble_values(h)
+        diff = 0
+        for i in range(len(vals) - 1):
+            diff += abs(vals[i] - vals[i + 1])
+        return "TÀI" if (diff % 16) >= 8 else "XỈU"
+
+    def model_16_alternating_sum(self, h: str) -> str:
+        vals = nibble_values(h)
+        alt = 0
+        for i, v in enumerate(vals):
+            alt += v if i % 2 == 0 else -v
+        alt = abs(alt)
+        return "TÀI" if (alt % 16) >= 8 else "XỈU"
+
+    def model_17_chunk_sum(self, h: str) -> str:
+        parts = hex_chunks(h, max(2, len(h) // 4))
+        s = sum(int(p, 16) for p in parts)
+        return "TÀI" if (s % 16) >= 8 else "XỈU"
+
+    def model_18_entropy_balance(self, h: str) -> str:
+        freq = Counter(h)
+        score = sum(v * v for v in freq.values())
+        return "TÀI" if (score % 2) == 0 else "XỈU"
+
+    def model_19_edge_balance(self, h: str) -> str:
+        head, _, tail = slice_hex(h)
+        left = int(head, 16)
+        right = int(tail, 16)
+        return "TÀI" if ((left ^ right) % 16) >= 8 else "XỈU"
+
+    def model_20_ascii_mix(self, h: str) -> str:
+        total = sum(ord(c) for c in h)
+        return "TÀI" if (total % 2) == 0 else "XỈU"
+
+    def model_21_mirror_balance(self, h: str) -> str:
+        half = len(h) // 2
+        left = h[:half]
+        right = h[-half:][::-1]
+        lv = int(left or "0", 16)
+        rv = int(right or "0", 16)
+        return "TÀI" if ((lv + rv) % 16) >= 8 else "XỈU"
+
+    def model_22_window_mix(self, h: str) -> str:
+        size = max(2, len(h) // 5)
+        parts = hex_chunks(h, size)
+        score = 0
+        for p in parts:
+            score += int(p, 16)
+        return "TÀI" if (score % 16) >= 8 else "XỈU"
+
+    def model_23_zigzag_balance(self, h: str) -> str:
+        vals = nibble_values(h)
+        even_sum = sum(vals[::2])
+        odd_sum = sum(vals[1::2])
+        z = abs(even_sum - odd_sum)
+        return "TÀI" if (z % 16) >= 8 else "XỈU"
 
     def predict(self, h: str) -> Tuple[str, int, int, Dict[str, str]]:
         h = norm_hex(h)
@@ -314,13 +469,27 @@ class AdaptiveBrain:
         models: List[Tuple[str, Callable[[str], str]]] = [
             ("baseline_sum16", self.model_01_baseline_sum16),
             ("full_mod", self.model_02_full_mod),
-            ("prime_mod", self.model_04_prime_mod),
-            ("slice_consensus", self.model_08_slice_consensus),
-            ("xor_mix", self.model_13_xor_mix),
-            ("power_mod", self.model_15_power_mod),
-            ("dice3", self.model_18_dice3),
-            ("position_weight", self.model_19_position_weight),
-            ("rolling_chunk", self.model_21_rolling_chunk),
+            ("prime_mod", self.model_03_prime_mod),
+            ("head_mod", self.model_04_head_mod),
+            ("mid_mod", self.model_05_mid_mod),
+            ("tail_mod", self.model_06_tail_mod),
+            ("slice_consensus", self.model_07_slice_consensus),
+            ("xor_mix", self.model_08_xor_mix),
+            ("power_mod", self.model_09_power_mod),
+            ("dice3", self.model_10_dice3),
+            ("position_weight", self.model_11_position_weight),
+            ("rolling_chunk", self.model_12_rolling_chunk),
+            ("reverse_parity", self.model_13_reverse_parity),
+            ("bit_count_parity", self.model_14_bit_count_parity),
+            ("pair_diff", self.model_15_pair_diff),
+            ("alternating_sum", self.model_16_alternating_sum),
+            ("chunk_sum", self.model_17_chunk_sum),
+            ("entropy_balance", self.model_18_entropy_balance),
+            ("edge_balance", self.model_19_edge_balance),
+            ("ascii_mix", self.model_20_ascii_mix),
+            ("mirror_balance", self.model_21_mirror_balance),
+            ("window_mix", self.model_22_window_mix),
+            ("zigzag_balance", self.model_23_zigzag_balance),
         ]
 
         tai_weight = 0.0
@@ -339,10 +508,7 @@ class AdaptiveBrain:
         total_weight = tai_weight + xiu_weight
         result = "TÀI" if tai_weight >= xiu_weight else "XỈU"
 
-        # Chấm điểm thận trọng hơn một chút để tránh tự tin ảo
         confidence = int(round((max(tai_weight, xiu_weight) / max(1e-9, total_weight)) * 100))
-        if self.streak_loss >= 3:
-            confidence = int(confidence * 0.85)
         confidence = max(50, min(99, confidence))
 
         score = int(round((tai_weight - xiu_weight) * 10))
@@ -369,7 +535,8 @@ class AdaptiveBrain:
         model_correct = 0
         for name, pred in case.model_preds.items():
             delta = 1.0 if pred == actual else -1.0
-            self.model_ewma[name] = (self.model_ewma.get(name, 0.0) * 0.92) + (delta * 0.08)
+            new_skill = (self.model_skill.get(name, 0.0) * 0.985) + (delta * 0.015)
+            self.model_skill[name] = clamp(new_skill, -1.0, 1.0)
             if pred == actual:
                 model_correct += 1
 
@@ -377,7 +544,8 @@ class AdaptiveBrain:
         for m in MODS_MAIN:
             pred_m = classify_by_mod_value(v, m, bias=0.50)
             delta = 1.0 if pred_m == actual else -1.0
-            self.mod_ewma[m] = (self.mod_ewma.get(m, 0.0) * 0.93) + (delta * 0.07)
+            new_skill = (self.mod_skill.get(m, 0.0) * 0.985) + (delta * 0.015)
+            self.mod_skill[m] = clamp(new_skill, -1.0, 1.0)
 
         self.feedback_count += 1
         self.last_feedback = actual
@@ -401,8 +569,8 @@ class AdaptiveBrain:
         }
 
     def status_text(self) -> str:
-        top_models = sorted(self.model_ewma.items(), key=lambda x: x[1], reverse=True)[:3]
-        top_mods = sorted(self.mod_ewma.items(), key=lambda x: x[1], reverse=True)[:3]
+        top_models = sorted(self.model_skill.items(), key=lambda x: x[1], reverse=True)[:5]
+        top_mods = sorted(self.mod_skill.items(), key=lambda x: x[1], reverse=True)[:5]
 
         lines = ["Trạng thái hiện tại:"]
         lines.append("Mô hình mạnh nhất: " + ", ".join(f"{n}({v:+.2f})" for n, v in top_models))
@@ -429,11 +597,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
 
-    await update.message.reply_text(
-        "Gửi hash hex vào đây để bot chốt TÀI/XỈU.\n"
-        "Sau đó gửi TÀI hoặc XỈU để bot tự học.\n"
-        "Reset sẽ xóa sạch toàn bộ trạng thái học như bot mới."
-    )
+    await update.message.reply_text(format_start_message(), parse_mode="HTML")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -441,13 +605,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "/start\n"
-        "/status\n"
-        "/reset\n\n"
-        "Cách dùng:\n"
+        "📖 <b>HƯỚNG DẪN</b>\n"
+        "━━━━━━━━━━━━━━\n"
         "1) Gửi hash hex\n"
         "2) Nhận kết quả TÀI/XỈU + %\n"
-        "3) Gửi kết quả thật là TÀI hoặc XỈU để bot tự thích nghi"
+        "3) Gửi kết quả thật là TÀI hoặc XỈU để bot tự ghi nhận\n"
+        "4) /reset để xóa sạch toàn bộ trạng thái",
+        parse_mode="HTML",
     )
 
 
@@ -456,7 +620,10 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async with LOCK:
-        await update.message.reply_text(brain.status_text())
+        await update.message.reply_text(
+            format_status_message(brain.status_text()),
+            parse_mode="HTML",
+        )
 
 
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -466,7 +633,11 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with LOCK:
         brain.reset_all()
 
-    await update.message.reply_text("Đã reset sạch toàn bộ trạng thái. Bot الآن như mới khởi động.")
+    await update.message.reply_text(
+        "📦 <b>Đã reset sạch toàn bộ trạng thái.</b>\n"
+        "Bot đã quay về như mới.",
+        parse_mode="HTML",
+    )
 
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -478,40 +649,49 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
     async with LOCK:
-        # Ưu tiên nhận feedback nếu đang có ca gần nhất
         actual = parse_result_label(text)
         if actual and brain.pending_case is not None:
             info = brain.learn_from_feedback(actual)
             if info is None:
-                await update.message.reply_text("Chưa có ca dự đoán nào để học.")
+                await update.message.reply_text(
+                    "⚠️ <b>Chưa có ca dự đoán nào để học.</b>",
+                    parse_mode="HTML",
+                )
                 return
 
             await update.message.reply_text(
-                f"Đã học từ phản hồi: {actual}\n"
-                f"Bot vừa dự đoán: {info['final_pred']} - {info['confidence']}%\n"
-                f"Mô hình đúng: {info['model_correct']}/{info['model_total']}"
+                format_feedback_message(
+                    actual=actual,
+                    final_pred=info["final_pred"],
+                    confidence=info["confidence"],
+                    model_correct=info["model_correct"],
+                    model_total=info["model_total"],
+                ),
+                parse_mode="HTML",
             )
             return
 
-        # Nếu là hash thì dự đoán
         h = extract_hex(text)
         if h:
             if len(h) < 8:
-                await update.message.reply_text("Chuỗi hex quá ngắn.")
+                await update.message.reply_text(
+                    "⚠️ <b>Chuỗi hex quá ngắn.</b>",
+                    parse_mode="HTML",
+                )
                 return
 
             result, confidence, score, _preds = brain.predict(h)
 
             await update.message.reply_text(
-                f"{result} - {confidence}%\n"
-                f"Score: {score}\n"
-                f"Giờ hãy gửi kết quả thật: TÀI hoặc XỈU để bot tự thích nghi."
+                format_prediction_message(result, confidence, score, h),
+                parse_mode="HTML",
             )
             return
 
         await update.message.reply_text(
-            "Không thấy hash hex hợp lệ.\n"
-            "Hoặc gửi hash, hoặc gửi TÀI/XỈU để feedback."
+            "❌ <b>Không thấy hash hex hợp lệ.</b>\n"
+            "Gửi hash hoặc gửi <b>TÀI</b>/<b>XỈU</b> để feedback.",
+            parse_mode="HTML",
         )
 
 
@@ -522,6 +702,7 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
+    app.add_handler(CommandHandler("hardreset", reset_cmd))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle))
 
     print("Bot đang chạy...")
