@@ -20,6 +20,7 @@ def load_env() -> None:
     p = Path(".env")
     if not p.exists():
         return
+
     for line in p.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -64,19 +65,28 @@ def normalize_text(text: str) -> str:
 
 
 def parse_result_label(text: str) -> Optional[str]:
+    """
+    Nhận feedback chỉ khi nội dung thực sự là TÀI/XỈU.
+    Tránh nhận nhầm các câu có chứa chữ giống như "HIEN TAI".
+    """
     t = normalize_text(text)
     t = re.sub(r"\s+", " ", t)
+    tokens = re.findall(r"[A-Z0-9]+", t)
 
-    if t in {"T", "TAI", "TÀI"}:
+    if not tokens:
+        return None
+
+    if tokens in (["T"], ["TAI"]):
         return "TÀI"
-    if t in {"X", "XIU", "XỈU"}:
+    if tokens in (["X"], ["XIU"]):
         return "XỈU"
 
-    # Cho phép kiểu "KET QUA TAI", "RESULT XIU", v.v.
-    if "TAI" in t and "XIU" not in t:
+    # Chấp nhận dạng "KET QUA TAI" / "RESULT XIU"
+    if "TAI" in tokens and "XIU" not in tokens:
         return "TÀI"
-    if "XIU" in t and "TAI" not in t:
+    if "XIU" in tokens and "TAI" not in tokens:
         return "XỈU"
+
     return None
 
 
@@ -192,18 +202,30 @@ class AdaptiveBrain:
     mod_ewma: Dict[int, float] = field(default_factory=dict)
     pending_case: Optional[PendingCase] = None
 
-    def __post_init__(self) -> None:
-        for name in MODEL_BASE_WEIGHTS:
-            self.model_ewma.setdefault(name, 0.0)
-        for m in MODS_MAIN:
-            self.mod_ewma.setdefault(m, 0.0)
+    prediction_count: int = 0
+    feedback_count: int = 0
+    streak_loss: int = 0
+    streak_win: int = 0
+    last_hash: Optional[str] = None
+    last_feedback: Optional[str] = None
 
-    def reset_learning(self) -> None:
-        for k in self.model_ewma:
-            self.model_ewma[k] = 0.0
-        for k in self.mod_ewma:
-            self.mod_ewma[k] = 0.0
+    def __post_init__(self) -> None:
+        self.reset_all()
+
+    def reset_all(self) -> None:
+        """
+        Reset sạch toàn bộ trạng thái, giống như bot mới khởi động.
+        """
+        self.model_ewma = {k: 0.0 for k in MODEL_BASE_WEIGHTS}
+        self.mod_ewma = {k: 0.0 for k in MODS_MAIN}
         self.pending_case = None
+
+        self.prediction_count = 0
+        self.feedback_count = 0
+        self.streak_loss = 0
+        self.streak_win = 0
+        self.last_hash = None
+        self.last_feedback = None
 
     def model_weight(self, model_name: str) -> float:
         base = MODEL_BASE_WEIGHTS.get(model_name, 1.0)
@@ -316,8 +338,17 @@ class AdaptiveBrain:
 
         total_weight = tai_weight + xiu_weight
         result = "TÀI" if tai_weight >= xiu_weight else "XỈU"
+
+        # Chấm điểm thận trọng hơn một chút để tránh tự tin ảo
         confidence = int(round((max(tai_weight, xiu_weight) / max(1e-9, total_weight)) * 100))
+        if self.streak_loss >= 3:
+            confidence = int(confidence * 0.85)
+        confidence = max(50, min(99, confidence))
+
         score = int(round((tai_weight - xiu_weight) * 10))
+
+        self.prediction_count += 1
+        self.last_hash = h
 
         self.pending_case = PendingCase(
             hash_text=h,
@@ -348,6 +379,16 @@ class AdaptiveBrain:
             delta = 1.0 if pred_m == actual else -1.0
             self.mod_ewma[m] = (self.mod_ewma.get(m, 0.0) * 0.93) + (delta * 0.07)
 
+        self.feedback_count += 1
+        self.last_feedback = actual
+
+        if case.final_pred == actual:
+            self.streak_win += 1
+            self.streak_loss = 0
+        else:
+            self.streak_loss += 1
+            self.streak_win = 0
+
         self.pending_case = None
 
         return {
@@ -363,9 +404,13 @@ class AdaptiveBrain:
         top_models = sorted(self.model_ewma.items(), key=lambda x: x[1], reverse=True)[:3]
         top_mods = sorted(self.mod_ewma.items(), key=lambda x: x[1], reverse=True)[:3]
 
-        lines = ["Trạng thái học hiện tại:"]
+        lines = ["Trạng thái hiện tại:"]
         lines.append("Mô hình mạnh nhất: " + ", ".join(f"{n}({v:+.2f})" for n, v in top_models))
         lines.append("Mod mạnh nhất: " + ", ".join(f"{m}({v:+.2f})" for m, v in top_mods))
+        lines.append(f"Số dự đoán: {self.prediction_count}")
+        lines.append(f"Số feedback: {self.feedback_count}")
+        lines.append(f"Chuỗi đúng: {self.streak_win}")
+        lines.append(f"Chuỗi sai: {self.streak_loss}")
 
         if self.pending_case:
             lines.append(f"Dự đoán gần nhất: {self.pending_case.final_pred} - {self.pending_case.confidence}%")
@@ -383,16 +428,18 @@ LOCK = asyncio.Lock()
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
+
     await update.message.reply_text(
         "Gửi hash hex vào đây để bot chốt TÀI/XỈU.\n"
-        "Sau đó gửi kết quả thực tế là TÀI hoặc XỈU để bot tự học.\n"
-        "Bot không lưu lịch sử chat, chỉ giữ trạng thái học và ca gần nhất."
+        "Sau đó gửi TÀI hoặc XỈU để bot tự học.\n"
+        "Reset sẽ xóa sạch toàn bộ trạng thái học như bot mới."
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
+
     await update.message.reply_text(
         "/start\n"
         "/status\n"
@@ -407,6 +454,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
+
     async with LOCK:
         await update.message.reply_text(brain.status_text())
 
@@ -414,9 +462,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or update.effective_user.id != ADMIN_ID:
         return
+
     async with LOCK:
-        brain.reset_learning()
-    await update.message.reply_text("Đã xóa trạng thái học và ca dự đoán gần nhất.")
+        brain.reset_all()
+
+    await update.message.reply_text("Đã reset sạch toàn bộ trạng thái. Bot الآن như mới khởi động.")
 
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -459,7 +509,6 @@ async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Không phải hash, không phải feedback
         await update.message.reply_text(
             "Không thấy hash hex hợp lệ.\n"
             "Hoặc gửi hash, hoặc gửi TÀI/XỈU để feedback."
