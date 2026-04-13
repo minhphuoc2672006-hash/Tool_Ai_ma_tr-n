@@ -72,10 +72,6 @@ def normalize_text(text: str) -> str:
 
 
 def parse_result_label(text: str) -> Optional[str]:
-    """
-    Chỉ nhận feedback thật sự là TÀI / XỈU.
-    Không bắt nhầm các câu như "HIEN TAI".
-    """
     t = normalize_text(text)
     t = re.sub(r"\s+", " ", t)
     tokens = re.findall(r"[A-Z0-9]+", t)
@@ -227,45 +223,31 @@ def dice3_from_hash(h: str) -> Tuple[int, int, int, int]:
 # =========================
 # MODEL CONFIG
 # =========================
-MODS_MAIN = [3, 5, 7, 11, 13, 17, 19, 23, 29]
-PRIME_MODS = [3, 5, 7, 11, 13, 17, 19, 23, 29]
+MODS_MAIN = [5, 7, 11, 13, 17, 19, 23, 29]
+PRIME_MODS = [5, 7, 11, 13, 17, 19, 23, 29]
 
 BASE_MOD_WEIGHTS: Dict[int, float] = {
-    3: 1.20,
-    5: 1.15,
-    7: 1.25,
-    11: 1.45,
-    13: 1.45,
-    17: 1.55,
-    19: 1.60,
-    23: 1.75,
-    29: 1.90,
+    5: 1.12,
+    7: 1.18,
+    11: 1.28,
+    13: 1.28,
+    17: 1.34,
+    19: 1.38,
+    23: 1.48,
+    29: 1.58,
 }
 
 MODEL_BASE_WEIGHTS: Dict[str, float] = {
     "baseline_sum16": 1.00,
     "full_mod": 1.45,
-    "prime_mod": 1.25,
+    "prime_mod": 1.28,
     "head_mod": 1.10,
-    "mid_mod": 1.10,
     "tail_mod": 1.10,
-    "slice_consensus": 1.30,
+    "slice_consensus": 1.22,
     "xor_mix": 1.25,
-    "power_mod": 1.15,
-    "dice3": 1.20,
-    "position_weight": 1.00,
-    "rolling_chunk": 1.15,
-    "reverse_parity": 1.05,
-    "bit_count_parity": 1.05,
-    "pair_diff": 1.10,
-    "alternating_sum": 1.05,
-    "chunk_sum": 1.05,
-    "entropy_balance": 1.00,
-    "edge_balance": 1.05,
-    "ascii_mix": 1.00,
-    "mirror_balance": 1.10,
-    "window_mix": 1.05,
-    "zigzag_balance": 1.05,
+    "power_mod": 1.18,
+    "dice3": 1.18,
+    "rolling_chunk": 1.12,
 }
 
 
@@ -312,15 +294,15 @@ class AdaptiveBrain:
     def model_weight(self, model_name: str) -> float:
         base = MODEL_BASE_WEIGHTS.get(model_name, 1.0)
         skill = self.model_skill.get(model_name, 0.0)
-        factor = 1.0 + (skill * 0.03)
-        factor = clamp(factor, 0.97, 1.03)
+        factor = 1.0 + (skill * 0.02)
+        factor = clamp(factor, 0.96, 1.04)
         return base * factor
 
     def mod_weight(self, m: int) -> float:
         base = BASE_MOD_WEIGHTS.get(m, 1.0)
         skill = self.mod_skill.get(m, 0.0)
-        factor = 1.0 + (skill * 0.03)
-        factor = clamp(factor, 0.97, 1.03)
+        factor = 1.0 + (skill * 0.02)
+        factor = clamp(factor, 0.96, 1.04)
         return base * factor
 
     def vote_mod(self, v: int, mods: List[int], bias: float = 0.5) -> str:
@@ -334,7 +316,7 @@ class AdaptiveBrain:
                 xiu += w
         return "TÀI" if tai >= xiu else "XỈU"
 
-    # ===== Individual models =====
+    # ===== Strong models =====
     def model_01_baseline_sum16(self, h: str) -> str:
         total = sum(int(c, 16) for c in h)
         score = (total % 16) + 3
@@ -353,115 +335,38 @@ class AdaptiveBrain:
         v = int(head, 16)
         return self.vote_mod(v, MODS_MAIN, bias=0.50)
 
-    def model_05_mid_mod(self, h: str) -> str:
-        _, mid, _ = slice_hex(h)
-        v = int(mid, 16)
-        return self.vote_mod(v, MODS_MAIN, bias=0.50)
-
-    def model_06_tail_mod(self, h: str) -> str:
+    def model_05_tail_mod(self, h: str) -> str:
         _, _, tail = slice_hex(h)
         v = int(tail, 16)
         return self.vote_mod(v, MODS_MAIN, bias=0.50)
 
-    def model_07_slice_consensus(self, h: str) -> str:
+    def model_06_slice_consensus(self, h: str) -> str:
         votes = [
             self.model_04_head_mod(h),
-            self.model_05_mid_mod(h),
-            self.model_06_tail_mod(h),
+            self.model_05_tail_mod(h),
+            self.model_03_prime_mod(h),
         ]
         tai = votes.count("TÀI")
         xiu = votes.count("XỈU")
         return "TÀI" if tai >= xiu else "XỈU"
 
-    def model_08_xor_mix(self, h: str) -> str:
+    def model_07_xor_mix(self, h: str) -> str:
         v = hex_to_int(h)
         mixed = v ^ (v >> 7) ^ (v << 11)
         return self.vote_mod(mixed, MODS_MAIN, bias=0.50)
 
-    def model_09_power_mod(self, h: str) -> str:
+    def model_08_power_mod(self, h: str) -> str:
         v = hex_to_int(h)
         mixed = (v * v) ^ (v >> 17) ^ (v << 9)
         return self.vote_mod(mixed, MODS_MAIN, bias=0.50)
 
-    def model_10_dice3(self, h: str) -> str:
+    def model_09_dice3(self, h: str) -> str:
         _, _, _, total = dice3_from_hash(h)
         return "TÀI" if total >= 11 else "XỈU"
 
-    def model_11_position_weight(self, h: str) -> str:
-        v = weighted_position_value(h)
-        return "TÀI" if (v % 16) >= 8 else "XỈU"
-
-    def model_12_rolling_chunk(self, h: str) -> str:
+    def model_10_rolling_chunk(self, h: str) -> str:
         v = chunk_xor_value(h)
         return self.vote_mod(v, MODS_MAIN, bias=0.50)
-
-    def model_13_reverse_parity(self, h: str) -> str:
-        r = h[::-1]
-        v = int(r, 16)
-        return "TÀI" if (v % 16) >= 8 else "XỈU"
-
-    def model_14_bit_count_parity(self, h: str) -> str:
-        bits = bin(int(h, 16))[2:]
-        ones = bits.count("1")
-        return "TÀI" if (ones % 2) == 0 else "XỈU"
-
-    def model_15_pair_diff(self, h: str) -> str:
-        vals = nibble_values(h)
-        diff = 0
-        for i in range(len(vals) - 1):
-            diff += abs(vals[i] - vals[i + 1])
-        return "TÀI" if (diff % 16) >= 8 else "XỈU"
-
-    def model_16_alternating_sum(self, h: str) -> str:
-        vals = nibble_values(h)
-        alt = 0
-        for i, v in enumerate(vals):
-            alt += v if i % 2 == 0 else -v
-        alt = abs(alt)
-        return "TÀI" if (alt % 16) >= 8 else "XỈU"
-
-    def model_17_chunk_sum(self, h: str) -> str:
-        parts = hex_chunks(h, max(2, len(h) // 4))
-        s = sum(int(p, 16) for p in parts)
-        return "TÀI" if (s % 16) >= 8 else "XỈU"
-
-    def model_18_entropy_balance(self, h: str) -> str:
-        freq = Counter(h)
-        score = sum(v * v for v in freq.values())
-        return "TÀI" if (score % 2) == 0 else "XỈU"
-
-    def model_19_edge_balance(self, h: str) -> str:
-        head, _, tail = slice_hex(h)
-        left = int(head, 16)
-        right = int(tail, 16)
-        return "TÀI" if ((left ^ right) % 16) >= 8 else "XỈU"
-
-    def model_20_ascii_mix(self, h: str) -> str:
-        total = sum(ord(c) for c in h)
-        return "TÀI" if (total % 2) == 0 else "XỈU"
-
-    def model_21_mirror_balance(self, h: str) -> str:
-        half = len(h) // 2
-        left = h[:half]
-        right = h[-half:][::-1]
-        lv = int(left or "0", 16)
-        rv = int(right or "0", 16)
-        return "TÀI" if ((lv + rv) % 16) >= 8 else "XỈU"
-
-    def model_22_window_mix(self, h: str) -> str:
-        size = max(2, len(h) // 5)
-        parts = hex_chunks(h, size)
-        score = 0
-        for p in parts:
-            score += int(p, 16)
-        return "TÀI" if (score % 16) >= 8 else "XỈU"
-
-    def model_23_zigzag_balance(self, h: str) -> str:
-        vals = nibble_values(h)
-        even_sum = sum(vals[::2])
-        odd_sum = sum(vals[1::2])
-        z = abs(even_sum - odd_sum)
-        return "TÀI" if (z % 16) >= 8 else "XỈU"
 
     def predict(self, h: str) -> Tuple[str, int, int, Dict[str, str]]:
         h = norm_hex(h)
@@ -471,25 +376,12 @@ class AdaptiveBrain:
             ("full_mod", self.model_02_full_mod),
             ("prime_mod", self.model_03_prime_mod),
             ("head_mod", self.model_04_head_mod),
-            ("mid_mod", self.model_05_mid_mod),
-            ("tail_mod", self.model_06_tail_mod),
-            ("slice_consensus", self.model_07_slice_consensus),
-            ("xor_mix", self.model_08_xor_mix),
-            ("power_mod", self.model_09_power_mod),
-            ("dice3", self.model_10_dice3),
-            ("position_weight", self.model_11_position_weight),
-            ("rolling_chunk", self.model_12_rolling_chunk),
-            ("reverse_parity", self.model_13_reverse_parity),
-            ("bit_count_parity", self.model_14_bit_count_parity),
-            ("pair_diff", self.model_15_pair_diff),
-            ("alternating_sum", self.model_16_alternating_sum),
-            ("chunk_sum", self.model_17_chunk_sum),
-            ("entropy_balance", self.model_18_entropy_balance),
-            ("edge_balance", self.model_19_edge_balance),
-            ("ascii_mix", self.model_20_ascii_mix),
-            ("mirror_balance", self.model_21_mirror_balance),
-            ("window_mix", self.model_22_window_mix),
-            ("zigzag_balance", self.model_23_zigzag_balance),
+            ("tail_mod", self.model_05_tail_mod),
+            ("slice_consensus", self.model_06_slice_consensus),
+            ("xor_mix", self.model_07_xor_mix),
+            ("power_mod", self.model_08_power_mod),
+            ("dice3", self.model_09_dice3),
+            ("rolling_chunk", self.model_10_rolling_chunk),
         ]
 
         tai_weight = 0.0
