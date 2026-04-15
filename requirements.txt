@@ -3,5 +3,4 @@ pytesseract
 python-telegram-bot==20.3
 httpx
 matplotlib==3.9.2
-requests
-python-dotenv
+pyTelegramBotAPI
