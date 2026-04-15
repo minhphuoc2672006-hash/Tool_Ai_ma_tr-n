@@ -115,6 +115,23 @@ def tx_name(v: Optional[int]) -> str:
 def safe_percent(x: float) -> int:
     return max(0, min(100, int(round(x * 100))))
 
+def pct_float(x: float, digits: int = 2) -> str:
+    return f"{x * 100:.{digits}f}"
+
+def cluster_display_state(score: float) -> str:
+    """
+    score là giá trị 0.0 -> 1.0
+    0.5000 trở xuống: GIỮ
+    0.5001 trở lên: vẫn dự đoán bình thường
+    """
+    if score <= 0.50:
+        return "GIỮ"
+    if score < 0.60:
+        return "YẾU"
+    if score < 0.75:
+        return "KHÁ RÕ"
+    return "RÕ"
+
 # ================= STREAKS =================
 def build_streak_blocks(seq: List[Optional[int]]) -> List[Tuple[int, int]]:
     out: List[Tuple[int, int]] = []
@@ -494,6 +511,7 @@ def make_prediction(stateful: bool = False):
             p_t = next_t / total_next
             p_x = next_x / total_next
 
+            # 50.07 vẫn là trên 50, không bị giữ.
             if abs(p_t - p_x) >= MIN_CLUSTER_EDGE:
                 score_t += 3.0 * weight * p_t
                 score_x += 3.0 * weight * p_x
@@ -540,7 +558,6 @@ def make_prediction(stateful: bool = False):
     p_x = score_x / total
 
     # ===== CÂN BẰNG ĐỂ KHÔNG NGHIÊNG MỘT PHÍA =====
-    # Nếu vừa ra cùng một phía quá nhiều lần, giảm nhẹ phía đó chứ không cấm dự đoán
     if stateful:
         last = prediction_memory.get("label")
         same_side = prediction_memory.get("same_side_count", 0)
@@ -554,6 +571,7 @@ def make_prediction(stateful: bool = False):
 
         prediction_memory["same_side_count"] = same_side
 
+        # chỉ giảm nhẹ, không ép về KHÔNG RÕ
         if same_side >= 3 and abs(p_t - p_x) < 0.20:
             if current_label == "TÀI":
                 p_t *= 0.92
@@ -576,10 +594,11 @@ def make_prediction(stateful: bool = False):
         label = "XỈU"
         pct = round(p_x * 100, 1)
 
+    # Nếu rất yếu thì vẫn ra kèo bình thường, chỉ hiển thị tỉ lệ thấp hơn
     if best < 0.52:
         pct = round(best * 100, 1)
 
-    if stateful and label != "KHÔNG_RÕ":
+    if stateful and label != "KHÔNG RÕ":
         prediction_memory["label"] = label
         prediction_memory["pct"] = pct
 
@@ -625,29 +644,40 @@ def dashboard_text():
     cluster_text = "Chưa đủ dữ liệu để nhận cụm."
     if cluster:
         nx, nt = cluster.get("next_tx", [0, 0])
+        cluster_score = cluster["score"]
+        cluster_state = cluster_display_state(cluster_score)
+
         cluster_text = (
-            f"Window: <b>{cluster['window']}</b>\n"
-            f"Mã cụm: <b>{cluster['id']}</b>\n"
-            f"Loại: <b>{cluster['kind']}</b>\n"
-            f"Mẫu hiện tại: <b>{cluster['sample']}</b>\n"
-            f"Đại diện: <b>{cluster['prototype']}</b>\n"
-            f"Khớp: <b>{safe_percent(cluster['score'])}%</b>\n"
-            f"Số lần gặp: <b>{cluster['count']}</b>\n"
-            f"Next(X/T): <b>{nx}/{nt}</b>"
+            f"┏━━━━━━━━━━━━━━━━━━━━━┓\n"
+            f"┃    🧩 CỤM HIỆN TẠI   ┃\n"
+            f"┗━━━━━━━━━━━━━━━━━━━━━┛\n"
+            f"• Window: <b>{cluster['window']}</b>\n"
+            f"• Mã cụm: <b>{cluster['id']}</b>\n"
+            f"• Loại: <b>{cluster['kind']}</b>\n"
+            f"• Trạng thái: <b>{cluster_state}</b>\n"
+            f"• Mẫu: <b>{cluster['sample']}</b>\n"
+            f"• Đại diện: <b>{cluster['prototype']}</b>\n"
+            f"• Điểm cụm: <b>{pct_float(cluster_score)}%</b>\n"
+            f"• Số lần gặp: <b>{cluster['count']}</b>\n"
+            f"• Next(X/T): <b>{nx}/{nt}</b>"
         )
 
     last_num = raw_numbers[-1] if raw_numbers else None
     last_tx = tx_name(tx_stream[-1]) if tx_stream else "N/A"
 
     return (
-        f"🤖 <b>AI Pattern Tool</b>\n\n"
+        f"🤖 <b>AI Pattern Tool</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📌 Số cuối: <b>{last_num if last_num is not None else 'N/A'}</b> ({last_tx})\n\n"
-        f"🧩 <b>Cụm hiện tại</b>\n{cluster_text}\n\n"
-        f"📍 <b>Trạng thái</b>: <b>{status}</b>\n"
-        f"🔎 Điểm cụm: <b>{safe_percent(score)}%</b>\n"
-        f"🧠 IT/Markov: <b>{ai_text}</b> ({safe_percent(ai_conf)}%)\n"
-        f"🎯 <b>Dự đoán:</b> <b>{prediction_label}</b>\n"
-        f"📈 <b>Tỷ lệ:</b> <b>{prediction_pct}%</b>\n\n"
+        f"{cluster_text}\n\n"
+        f"┏━━━━━━━━━━━━━━━━━━━━━┓\n"
+        f"┃     📊 KẾT QUẢ AI    ┃\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━┛\n"
+        f"• Trạng thái: <b>{status}</b>\n"
+        f"• Điểm tổng: <b>{safe_percent(score)}%</b>\n"
+        f"• IT/Markov: <b>{ai_text}</b> ({safe_percent(ai_conf)}%)\n"
+        f"• Dự đoán: <b>{prediction_label}</b>\n"
+        f"• Tỷ lệ: <b>{prediction_pct}%</b>\n\n"
         f"📚 Tổng phiên: <b>{len(raw_numbers)}</b>\n"
         f"🎯 T/X hợp lệ: <b>{len(valid_tx)}</b>\n"
         f"🧱 Streak gần nhất: <b>{streaks[-8:] if streaks else []}</b>"
@@ -944,15 +974,21 @@ def handle_text(msg):
 
     if cluster:
         nx, nt = cluster.get("next_tx", [0, 0])
+        cluster_score = cluster["score"]
+        cluster_state = cluster_display_state(cluster_score)
         cluster_text = (
-            f"Window: <b>{cluster['window']}</b>\n"
-            f"Mã cụm: <b>{cluster['id']}</b>\n"
-            f"Loại: <b>{cluster['kind']}</b>\n"
-            f"Mẫu hiện tại: <b>{cluster['sample']}</b>\n"
-            f"Đại diện: <b>{cluster['prototype']}</b>\n"
-            f"Khớp: <b>{safe_percent(cluster['score'])}%</b>\n"
-            f"Số lần gặp: <b>{cluster['count']}</b>\n"
-            f"Next(X/T): <b>{nx}/{nt}</b>"
+            f"┏━━━━━━━━━━━━━━━━━━━━━┓\n"
+            f"┃    🧩 CỤM HIỆN TẠI   ┃\n"
+            f"┗━━━━━━━━━━━━━━━━━━━━━┛\n"
+            f"• Window: <b>{cluster['window']}</b>\n"
+            f"• Mã cụm: <b>{cluster['id']}</b>\n"
+            f"• Loại: <b>{cluster['kind']}</b>\n"
+            f"• Trạng thái: <b>{cluster_state}</b>\n"
+            f"• Mẫu: <b>{cluster['sample']}</b>\n"
+            f"• Đại diện: <b>{cluster['prototype']}</b>\n"
+            f"• Điểm cụm: <b>{pct_float(cluster_score)}%</b>\n"
+            f"• Số lần gặp: <b>{cluster['count']}</b>\n"
+            f"• Next(X/T): <b>{nx}/{nt}</b>"
         )
     else:
         cluster_text = "Chưa đủ dữ liệu để nhận cụm."
@@ -962,13 +998,17 @@ def handle_text(msg):
 
     bot.send_message(
         msg.chat.id,
-        f"✅ Đã nhận: <b>{last_num}</b> ({last_tx})\n\n"
-        f"🧩 <b>Cụm hiện tại</b>\n{cluster_text}\n\n"
-        f"📍 <b>Trạng thái</b>: <b>{status}</b>\n"
-        f"🔎 Điểm cụm: <b>{safe_percent(score)}%</b>\n"
-        f"🧠 IT/Markov: <b>{ai_text}</b> ({safe_percent(ai_conf)}%)\n"
-        f"🎯 <b>Dự đoán:</b> <b>{prediction_label}</b>\n"
-        f"📈 <b>Tỷ lệ:</b> <b>{prediction_pct}%</b>\n\n"
+        f"✅ <b>Đã nhận:</b> <b>{last_num}</b> ({last_tx})\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{cluster_text}\n\n"
+        f"┏━━━━━━━━━━━━━━━━━━━━━┓\n"
+        f"┃     📊 KẾT QUẢ AI    ┃\n"
+        f"┗━━━━━━━━━━━━━━━━━━━━━┛\n"
+        f"• Trạng thái: <b>{status}</b>\n"
+        f"• Điểm tổng: <b>{safe_percent(score)}%</b>\n"
+        f"• IT/Markov: <b>{ai_text}</b> ({safe_percent(ai_conf)}%)\n"
+        f"• Dự đoán: <b>{prediction_label}</b>\n"
+        f"• Tỷ lệ: <b>{prediction_pct}%</b>\n\n"
         f"📚 Tổng phiên: <b>{len(raw_numbers)}</b>\n"
         f"🎯 T/X hợp lệ: <b>{len(valid_tx)}</b>",
         reply_markup=main_menu(),
